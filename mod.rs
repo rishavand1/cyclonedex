@@ -16,25 +16,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-pub(crate) mod annotation;
-pub(crate) mod attachment;
-pub(crate) mod component_data;
-pub(crate) mod data_governance;
-pub(crate) mod evidence;
-pub(crate) mod formulation;
-pub(crate) mod licensing;
-pub(crate) mod lifecycles;
-pub(crate) mod modelcard;
-pub(crate) mod proof_of_concept;
-pub(crate) mod service_data;
+pub mod date_time;
+pub mod normalized_string;
+pub mod spdx;
+pub mod uri;
 
-pub(crate) use crate::specs::common::bom::v1_5 as bom;
-pub(crate) use crate::specs::common::component::v1_5 as component;
-pub(crate) use crate::specs::common::composition::v1_5 as composition;
-pub(crate) use crate::specs::common::external_reference::v1_5 as external_reference;
-pub(crate) use crate::specs::common::license::v1_5 as license;
-pub(crate) use crate::specs::common::metadata::v1_5 as metadata;
-pub(crate) use crate::specs::common::service::v1_5 as service;
-pub(crate) use crate::specs::common::tool::v1_5 as tool;
-pub(crate) use crate::specs::common::vulnerability::v1_5 as vulnerability;
-pub(crate) use crate::specs::common::vulnerability_analysis::v1_5 as vulnerability_analysis;
+pub(crate) use date_time::validate_date_time;
