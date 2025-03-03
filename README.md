@@ -6,45 +6,94 @@
 [![Group Discussion](https://img.shields.io/badge/discussion-groups.io-blue.svg)](https://groups.io/g/CycloneDX)
 [![Twitter](https://img.shields.io/twitter/url/http/shields.io.svg?style=social&label=Follow)](https://twitter.com/CycloneDX_Spec)
 
-# CycloneDX Rust (Cargo) Plugin
+# `cyclonedx-bom`
 
-The CycloneDX module for Rust (Cargo) creates a valid CycloneDX Software Bill of Materials (SBOM) containing an
-aggregate of all project dependencies.
-OWASP CycloneDX is a full-stack Bill of Materials (BOM) standard providing advanced supply chain capabilities for cyber risk reduction.
+The [CycloneDX](https://cyclonedx.org/) library provides JSON and XML serialization and deserialization of Software Bill-of-Materials (SBOM) files.
 
-## Structure
+CycloneDX is a full-stack SBOM/xBOM standard designed for use in application security contexts and supply chain component analysis.
 
-This repository contains two separate projects:
+The library is intended to enable developers to:
 
-- [`cyclonedx-bom`](./cyclonedx-bom/README.md) is a Rust library to read and write CycloneDX SBOMs to and from Rust structs.
-- [`cargo-cyclonedx`](./cargo-cyclonedx/README.md) is a Rust application, which generates CycloneDX SBOMs for Cargo based Rust projects (it uses `cyclonedx-bom` for that purpose).
+- Construct SBOM documents that conform the CycloneDX specification
+- Parse and validate JSON and XML SBOM documents
+- Perform modifications to BOM documents (e.g. merging multiple BOMs using a variety of algorithms)
+         
+## Supported CycloneDX versions
+
+This library currently supports CycloneDX 1.3, 1.4 and 1.5.
 
 ## Usage
 
-Execute `cargo-cyclonedx` from within a Rust project directory containing Cargo.toml.
+### Read and validate an SBOM
 
-### Installing
+```rust
+use cyclonedx_bom::prelude::*;
 
-```bash
-cargo install cargo-cyclonedx
+let bom_json = r#"{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "serialNumber": "urn:uuid:3e671687-395b-41f5-a30f-a58921a69b79",
+  "version": 1
+}"#;
+let bom = Bom::parse_from_json_v1_5(bom_json.as_bytes()).expect("Failed to parse BOM");
+
+let validation_result = bom.validate();
+assert!(validation_result.passed());
 ```
 
-### Executing binary
+### Create and output an SBOM
 
-```bash
-~/.cargo/bin/cargo-cyclonedx cyclonedx
+```rust
+use cyclonedx_bom::prelude::*;
+use cyclonedx_bom::models::{
+    tool::{Tool, Tools},
+};
+
+let bom = Bom {
+    serial_number: Some(
+        UrnUuid::new("urn:uuid:3e671687-395b-41f5-a30f-a58921a69b79".to_string())
+            .expect("Failed to create UrnUuid"),
+    ),
+    metadata: Some(Metadata {
+        tools: Some(Tools::List(vec![Tool {
+            name: Some(NormalizedString::new("my_tool")),
+            ..Tool::default()
+        }])),
+        ..Metadata::default()
+    }),
+    ..Bom::default()
+};
+
+let mut output = Vec::<u8>::new();
+
+bom.output_as_json_v1_5(&mut output)
+    .expect("Failed to write BOM");
+let output = String::from_utf8(output).expect("Failed to read output as a string");
+assert_eq!(
+    output,
+    r#"{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "version": 1,
+  "serialNumber": "urn:uuid:3e671687-395b-41f5-a30f-a58921a69b79",
+  "metadata": {
+    "tools": [
+      {
+        "name": "my_tool"
+      }
+    ]
+  }
+}"#
+);
 ```
 
-### Executing from cargo
+## Verification and Validation
 
-```bash
-cargo cyclonedx
-```
+See [README](./tests/README.md) for details.
 
 ## Contributing
 
-Contributions are welcome.
-See our [`CONTRIBUTING.md`](CONTRIBUTING.md) for details.
+See [CONTRIBUTING](../CONTRIBUTING.md) for details.
 
 ### Bug Bounty
 
