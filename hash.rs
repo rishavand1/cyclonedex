@@ -16,154 +16,191 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use once_cell::sync::Lazy;
-use regex::Regex;
+use crate::{
+    errors::XmlReadError,
+    models,
+    utilities::convert_vec,
+    xml::{attribute_or_error, read_list_tag, read_simple_tag, to_xml_write_error, FromXml, ToXml},
+};
+use serde::{Deserialize, Serialize};
+use xml::writer;
 
-use crate::validation::{Validate, ValidationContext, ValidationError, ValidationResult};
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[serde(transparent)]
+pub(crate) struct Hashes(pub(crate) Vec<Hash>);
 
-use super::bom::SpecVersion;
-
-/// Represents the hash of the component
-///
-/// Defined via the [CycloneDX XML schema](https://cyclonedx.org/docs/1.3/xml/#type_hashType)
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Hash {
-    pub alg: HashAlgorithm,
-    pub content: HashValue,
-}
-
-impl Validate for Hash {
-    fn validate_version(&self, _version: SpecVersion) -> ValidationResult {
-        ValidationContext::new()
-            .add_field("alg", &self.alg, validate_hash_algorithm)
-            .add_field("content", &self.content, validate_hash_value)
-            .into()
+impl From<models::hash::Hashes> for Hashes {
+    fn from(other: models::hash::Hashes) -> Self {
+        Hashes(convert_vec(other.0))
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Hashes(pub Vec<Hash>);
-
-impl Validate for Hashes {
-    fn validate_version(&self, version: SpecVersion) -> ValidationResult {
-        ValidationContext::new()
-            .add_list("inner", &self.0, |hash| hash.validate_version(version))
-            .into()
+impl From<Hashes> for models::hash::Hashes {
+    fn from(other: Hashes) -> Self {
+        models::hash::Hashes(convert_vec(other.0))
     }
 }
 
-pub fn validate_hash_algorithm(algorithm: &HashAlgorithm) -> Result<(), ValidationError> {
-    if matches!(algorithm, HashAlgorithm::UnknownHashAlgorithm(_)) {
-        return Err(ValidationError::new("Unknown HashAlgorithm"));
+const HASHES_TAG: &str = "hashes";
+
+impl ToXml for Hashes {
+    fn write_xml_element<W: std::io::Write>(
+        &self,
+        writer: &mut xml::EventWriter<W>,
+    ) -> Result<(), crate::errors::XmlWriteError> {
+        writer
+            .write(writer::XmlEvent::start_element(HASHES_TAG))
+            .map_err(to_xml_write_error(HASHES_TAG))?;
+
+        for hash in &self.0 {
+            hash.write_xml_element(writer)?;
+        }
+
+        writer
+            .write(writer::XmlEvent::end_element())
+            .map_err(to_xml_write_error(HASHES_TAG))?;
+        Ok(())
     }
-    Ok(())
 }
 
-/// Represents the algorithm used to create the hash
-///
-/// Defined via the [CycloneDX XML schema](https://cyclonedx.org/docs/1.3/xml/#type_hashAlg)
-#[allow(non_camel_case_types)]
-#[derive(Clone, Debug, PartialEq, Eq, Hash, strum::Display)]
-#[strum(serialize_all = "SCREAMING-KEBAB-CASE")]
-pub enum HashAlgorithm {
-    MD5,
-    #[strum(serialize = "SHA-1")]
-    SHA1,
-    SHA_256,
-    SHA_384,
-    SHA_512,
-    SHA3_256,
-    SHA3_384,
-    SHA3_512,
-    #[strum(serialize = "BLAKE2b-256")]
-    BLAKE2b_256,
-    #[strum(serialize = "BLAKE2b-384")]
-    BLAKE2b_384,
-    #[strum(serialize = "BLAKE2b-512")]
-    BLAKE2b_512,
-    BLAKE3,
-    #[doc(hidden)]
-    #[strum(default)]
-    UnknownHashAlgorithm(String),
+impl FromXml for Hashes {
+    fn read_xml_element<R: std::io::Read>(
+        event_reader: &mut xml::EventReader<R>,
+        element_name: &xml::name::OwnedName,
+        _attributes: &[xml::attribute::OwnedAttribute],
+    ) -> Result<Self, XmlReadError>
+    where
+        Self: Sized,
+    {
+        read_list_tag(event_reader, element_name, HASH_TAG).map(Hashes)
+    }
 }
-impl HashAlgorithm {
-    pub fn new_unchecked<A: AsRef<str>>(value: A) -> Self {
-        match value.as_ref() {
-            "MD5" => Self::MD5,
-            "SHA-1" => Self::SHA1,
-            "SHA-256" => Self::SHA_256,
-            "SHA-384" => Self::SHA_384,
-            "SHA-512" => Self::SHA_512,
-            "SHA3-256" => Self::SHA3_256,
-            "SHA3-384" => Self::SHA3_384,
-            "SHA3-512" => Self::SHA3_512,
-            "BLAKE2b-256" => Self::BLAKE2b_256,
-            "BLAKE2b-384" => Self::BLAKE2b_384,
-            "BLAKE2b-512" => Self::BLAKE2b_512,
-            "BLAKE3" => Self::BLAKE3,
-            unknown => Self::UnknownHashAlgorithm(unknown.to_string()),
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Hash {
+    pub(crate) alg: String,
+    pub(crate) content: HashValue,
+}
+
+impl From<models::hash::Hash> for Hash {
+    fn from(other: models::hash::Hash) -> Self {
+        Self {
+            alg: other.alg.to_string(),
+            content: other.content.into(),
         }
     }
 }
 
-pub fn validate_hash_value(value: &HashValue) -> Result<(), ValidationError> {
-    static HASH_VALUE_REGEX: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(
-            r"^([a-fA-F0-9]{32})|([a-fA-F0-9]{40})|([a-fA-F0-9]{64})|([a-fA-F0-9]{96})|([a-fA-F0-9]{128})$",
-        ).expect("Failed to compile regex.")
-    });
-
-    if !HASH_VALUE_REGEX.is_match(&value.0) {
-        return Err(ValidationError::new(
-            "HashValue does not match regular expression",
-        ));
+impl From<Hash> for models::hash::Hash {
+    fn from(other: Hash) -> Self {
+        Self {
+            alg: models::hash::HashAlgorithm::new_unchecked(other.alg),
+            content: other.content.into(),
+        }
     }
-
-    Ok(())
 }
 
-/// Defined via the [CycloneDX XML schema](https://cyclonedx.org/docs/1.3/xml/#type_hashValue)
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct HashValue(pub String);
+const HASH_TAG: &str = "hash";
+const ALG_ATTR: &str = "alg";
+
+impl ToXml for Hash {
+    fn write_xml_element<W: std::io::Write>(
+        &self,
+        writer: &mut xml::EventWriter<W>,
+    ) -> Result<(), crate::errors::XmlWriteError> {
+        writer
+            .write(writer::XmlEvent::start_element(HASH_TAG).attr(ALG_ATTR, &self.alg))
+            .map_err(to_xml_write_error(HASH_TAG))?;
+
+        writer
+            .write(writer::XmlEvent::characters(&self.content.0))
+            .map_err(to_xml_write_error(HASH_TAG))?;
+
+        writer
+            .write(writer::XmlEvent::end_element())
+            .map_err(to_xml_write_error(HASH_TAG))?;
+        Ok(())
+    }
+}
+
+impl FromXml for Hash {
+    fn read_xml_element<R: std::io::Read>(
+        event_reader: &mut xml::EventReader<R>,
+        element_name: &xml::name::OwnedName,
+        attributes: &[xml::attribute::OwnedAttribute],
+    ) -> Result<Self, XmlReadError>
+    where
+        Self: Sized,
+    {
+        let alg = attribute_or_error(element_name, attributes, ALG_ATTR)?;
+        let value = read_simple_tag(event_reader, element_name)?;
+
+        Ok(Self {
+            alg,
+            content: HashValue(value),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+pub(crate) struct HashValue(pub(crate) String);
+
+impl From<models::hash::HashValue> for HashValue {
+    fn from(other: models::hash::HashValue) -> Self {
+        Self(other.0)
+    }
+}
+
+impl From<HashValue> for models::hash::HashValue {
+    fn from(other: HashValue) -> Self {
+        Self(other.0)
+    }
+}
 
 #[cfg(test)]
-mod test {
-    use crate::validation::{self};
+pub(crate) mod test {
+    use crate::xml::test::{read_element_from_string, write_element_to_string};
 
     use super::*;
-    use pretty_assertions::assert_eq;
 
-    #[test]
-    fn it_should_pass_validation() {
-        let validation_result = Hashes(vec![Hash {
-            alg: HashAlgorithm::MD5,
-            content: HashValue("a3bf1f3d584747e2569483783ddee45b".to_string()),
-        }])
-        .validate_version(SpecVersion::V1_3);
+    pub(crate) fn example_hashes() -> Hashes {
+        Hashes(vec![example_hash()])
+    }
 
-        assert!(validation_result.passed());
+    pub(crate) fn corresponding_hashes() -> models::hash::Hashes {
+        models::hash::Hashes(vec![corresponding_hash()])
+    }
+
+    pub(crate) fn example_hash() -> Hash {
+        Hash {
+            alg: "algorithm".to_string(),
+            content: HashValue("hash value".to_string()),
+        }
+    }
+
+    pub(crate) fn corresponding_hash() -> models::hash::Hash {
+        models::hash::Hash {
+            alg: models::hash::HashAlgorithm::UnknownHashAlgorithm("algorithm".to_string()),
+            content: models::hash::HashValue("hash value".to_string()),
+        }
     }
 
     #[test]
-    fn it_should_fail_validation() {
-        let validation_result = Hashes(vec![Hash {
-            alg: HashAlgorithm::UnknownHashAlgorithm("unknown algorithm".to_string()),
-            content: HashValue("not a hash".to_string()),
-        }])
-        .validate_version(SpecVersion::V1_3);
+    fn it_should_write_xml_full() {
+        let xml_output = write_element_to_string(example_hashes());
+        insta::assert_snapshot!(xml_output);
+    }
 
-        assert_eq!(
-            validation_result,
-            validation::list(
-                "inner",
-                [(
-                    0,
-                    vec![
-                        validation::field("alg", "Unknown HashAlgorithm"),
-                        validation::field("content", "HashValue does not match regular expression")
-                    ]
-                )]
-            )
-        );
+    #[test]
+    fn it_should_read_xml_full() {
+        let input = r#"
+<hashes>
+  <hash alg="algorithm">hash value</hash>
+</hashes>
+"#;
+        let actual: Hashes = read_element_from_string(input);
+        let expected = example_hashes();
+        assert_eq!(actual, expected);
     }
 }

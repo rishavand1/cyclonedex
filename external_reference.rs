@@ -16,403 +16,264 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use once_cell::sync::Lazy;
-use regex::Regex;
+use cyclonedx_bom_macros::versioned;
 
-use crate::external_models::uri::{validate_uri as validate_url, Uri as Url};
-use crate::models::hash::Hashes;
-use crate::validation::{Validate, ValidationContext, ValidationError, ValidationResult};
-
-use super::bom::SpecVersion;
-
-/// Represents a way to document systems, sites, and information that may be relevant but which are not included with the BOM.
-///
-/// Please see the [CycloneDX use case](https://cyclonedx.org/use-cases/#external-references) for more information and examples.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ExternalReference {
-    pub external_reference_type: ExternalReferenceType,
-    pub url: Uri,
-    pub comment: Option<String>,
-    pub hashes: Option<Hashes>,
-}
-
-impl ExternalReference {
-    /// Constructs a new `ExternalReference` with the reference type and url
-    /// ```
-    /// use cyclonedx_bom::models::external_reference::{ExternalReference, ExternalReferenceType};
-    /// use cyclonedx_bom::external_models::uri::Uri;
-    ///
-    /// let url = Uri::new("https://example.org/support/sbom/portal-server/1.0.0");
-    /// let external_reference = ExternalReference::new(ExternalReferenceType::Bom, url);
-    /// ```
-    pub fn new(external_reference_type: ExternalReferenceType, url: impl Into<Uri>) -> Self {
-        Self {
-            external_reference_type,
-            url: url.into(),
-            comment: None,
-            hashes: None,
-        }
-    }
-}
-
-impl Validate for ExternalReference {
-    fn validate_version(&self, version: SpecVersion) -> ValidationResult {
-        ValidationContext::new()
-            .add_field(
-                "external_reference_type",
-                &self.external_reference_type,
-                validate_external_reference_type,
-            )
-            .add_field("url", &self.url, |uri| validate_reference_uri(uri, version))
-            .add_list("hashes", &self.hashes, |hash| {
-                hash.validate_version(version)
-            })
-            .into()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ExternalReferences(pub Vec<ExternalReference>);
-
-impl Validate for ExternalReferences {
-    fn validate_version(&self, version: SpecVersion) -> ValidationResult {
-        ValidationContext::new()
-            .add_list("inner", &self.0, |reference| {
-                reference.validate_version(version)
-            })
-            .into()
-    }
-}
-
-pub fn validate_external_reference_type(
-    reference_type: &ExternalReferenceType,
-) -> Result<(), ValidationError> {
-    if matches!(
-        reference_type,
-        ExternalReferenceType::UnknownExternalReferenceType(_)
-    ) {
-        return Err("Unknown external reference type".into());
-    }
-    Ok(())
-}
-
-/// Defined via the [CycloneDX XML schema](https://cyclonedx.org/docs/1.3/xml/#type_externalReferenceType).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, strum::Display)]
-#[strum(serialize_all = "kebab-case")]
-pub enum ExternalReferenceType {
-    Vcs,
-    IssueTracker,
-    Website,
-    Advisories,
-    Bom,
-    MailingList,
-    Social,
-    Chat,
-    Documentation,
-    Support,
-    Distribution,
-    DistributionIntake,
-    License,
-    BuildMeta,
-    BuildSystem,
-    Other,
-    #[doc(hidden)]
-    #[strum(default)]
-    UnknownExternalReferenceType(String),
-    ReleaseNotes,
-    SecurityContact,
-    ModelCard,
-    Log,
-    Configuration,
-    Evidence,
-    Formulation,
-    Attestation,
-    ThreatModel,
-    AdversaryModel,
-    RiskAssessment,
-    VulnerabilityAssertion,
-    ExploitabilityStatement,
-    PentestReport,
-    StaticAnalysisReport,
-    DynamicAnalysisReport,
-    RuntimeAnalysisReport,
-    ComponentAnalysisReport,
-    MaturityReport,
-    CertificationReport,
-    CondifiedInfrastructure,
-    QualityMetrics,
-    Poam,
-}
-
-impl ExternalReferenceType {
-    pub fn new_unchecked<A: AsRef<str>>(value: A) -> Self {
-        match value.as_ref() {
-            "vcs" => Self::Vcs,
-            "issue-tracker" => Self::IssueTracker,
-            "website" => Self::Website,
-            "advisories" => Self::Advisories,
-            "bom" => Self::Bom,
-            "mailing-list" => Self::MailingList,
-            "social" => Self::Social,
-            "chat" => Self::Chat,
-            "documentation" => Self::Documentation,
-            "support" => Self::Support,
-            "distribution" => Self::Distribution,
-            "distribution-intake" => Self::DistributionIntake,
-            "license" => Self::License,
-            "build-meta" => Self::BuildMeta,
-            "build-system" => Self::BuildSystem,
-            "release-notes" => Self::ReleaseNotes,
-            "security-contact" => Self::SecurityContact,
-            "model-card" => Self::ModelCard,
-            "log" => Self::Log,
-            "configuration" => Self::Configuration,
-            "evidence" => Self::Evidence,
-            "formulation" => Self::Formulation,
-            "attestation" => Self::Attestation,
-            "threat-model" => Self::ThreatModel,
-            "adversary-model" => Self::AdversaryModel,
-            "risk-assessment" => Self::RiskAssessment,
-            "vulnerability-assertion" => Self::VulnerabilityAssertion,
-            "exploitability-statement" => Self::ExploitabilityStatement,
-            "pentest-report" => Self::PentestReport,
-            "static-analysis-report" => Self::StaticAnalysisReport,
-            "dynamic-analysis-report" => Self::DynamicAnalysisReport,
-            "runtime-analysis-report" => Self::RuntimeAnalysisReport,
-            "component-analysis-report" => Self::ComponentAnalysisReport,
-            "maturity-report" => Self::MaturityReport,
-            "certification-report" => Self::CertificationReport,
-            "codified-infrastructure" => Self::CondifiedInfrastructure,
-            "quality-metrics" => Self::QualityMetrics,
-            "poam" => Self::Poam,
-            "other" => Self::Other,
-            unknown => Self::UnknownExternalReferenceType(unknown.to_string()),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Uri {
-    Url(Url),
-    BomLink(BomLink),
-}
-
-/// Validates an [`Uri`], the [`Uri::BomLink`] variant was added in 1.5 only.
-fn validate_reference_uri(uri: &Uri, version: SpecVersion) -> Result<(), ValidationError> {
-    match uri {
-        Uri::Url(url) => validate_url(url),
-        Uri::BomLink(bom_link) => validate_bom_link(bom_link, version),
-    }
-}
-
-impl From<Url> for Uri {
-    fn from(url: Url) -> Self {
-        if url.is_bomlink() {
-            Self::BomLink(BomLink(url.to_string()))
-        } else {
-            Self::Url(url)
-        }
-    }
-}
-
-impl std::fmt::Display for Uri {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            Uri::Url(uri) => uri.to_string(),
-            Uri::BomLink(link) => link.0.to_string(),
-        };
-        write!(f, "{s}")
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct BomLink(pub String);
-
-fn validate_bom_link(bom_link: &BomLink, version: SpecVersion) -> Result<(), ValidationError> {
-    if version < SpecVersion::V1_5 {
-        return Err("BOM-Link not supported before version 1.5".into());
-    }
-
-    static BOM_LINK_REGEX: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"^urn:cdx:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/[1-9][0-9]*(#.+)?$").unwrap()
-    });
-
-    if !BOM_LINK_REGEX.is_match(&bom_link.0) {
-        return Err(ValidationError::new("Invalid BOM-Link"));
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
-mod test {
+#[versioned("1.3", "1.4", "1.5")]
+pub(crate) mod base {
     use crate::{
-        models::hash::{Hash, HashValue},
-        validation,
+        errors::XmlReadError,
+        models,
+        specs::common::hash::Hashes,
+        utilities::{convert_optional, convert_vec},
+        xml::{
+            attribute_or_error, read_list_tag, read_simple_tag, to_xml_read_error,
+            to_xml_write_error, unexpected_element_error, write_close_tag, write_simple_tag,
+            write_start_tag, FromXml, ToXml,
+        },
     };
+    use serde::{Deserialize, Serialize};
+    use xml::{reader, writer::XmlEvent};
 
-    use super::*;
-    use pretty_assertions::assert_eq;
+    #[derive(Debug, Deserialize, Serialize, PartialEq)]
+    #[serde(transparent)]
+    pub(crate) struct ExternalReferences(Vec<ExternalReference>);
 
-    #[test]
-    fn it_should_convert_url_into_uri() {
-        let url = Url("https://example.com".to_string());
-        assert_eq!(Uri::Url(Url("https://example.com".to_string())), url.into());
+    impl From<crate::models::external_reference::ExternalReferences> for ExternalReferences {
+        fn from(other: crate::models::external_reference::ExternalReferences) -> Self {
+            ExternalReferences(convert_vec(other.0))
+        }
     }
 
-    #[test]
-    fn it_should_convert_url_into_bomlink() {
-        let url = Url("urn:cdx:f08a6ccd-4dce-4759-bd84-c626675d60a7/1".to_string());
-        assert_eq!(
-            Uri::BomLink(BomLink(
-                "urn:cdx:f08a6ccd-4dce-4759-bd84-c626675d60a7/1".to_string()
-            )),
-            url.into()
-        );
+    impl From<ExternalReferences> for models::external_reference::ExternalReferences {
+        fn from(other: ExternalReferences) -> Self {
+            models::external_reference::ExternalReferences(convert_vec(other.0))
+        }
     }
 
-    #[test]
-    fn it_should_validate_external_reference_with_bomlink_correctly() {
-        let url = Uri::BomLink(BomLink(
-            "urn:cdx:f08a6ccd-4dce-4759-bd84-c626675d60a7/1".to_string(),
-        ));
+    const EXTERNAL_REFERENCES_TAG: &str = "externalReferences";
 
-        let external_reference = ExternalReference {
-            external_reference_type: ExternalReferenceType::Bom,
-            url,
-            comment: Some("Comment".to_string()),
-            hashes: Some(Hashes(vec![])),
+    impl ToXml for ExternalReferences {
+        fn write_xml_element<W: std::io::Write>(
+            &self,
+            writer: &mut xml::EventWriter<W>,
+        ) -> Result<(), crate::errors::XmlWriteError> {
+            write_start_tag(writer, EXTERNAL_REFERENCES_TAG)?;
+
+            for external_reference in &self.0 {
+                external_reference.write_xml_element(writer)?;
+            }
+
+            write_close_tag(writer, EXTERNAL_REFERENCES_TAG)?;
+
+            Ok(())
+        }
+    }
+
+    impl FromXml for ExternalReferences {
+        fn read_xml_element<R: std::io::Read>(
+            event_reader: &mut xml::EventReader<R>,
+            element_name: &xml::name::OwnedName,
+            _attributes: &[xml::attribute::OwnedAttribute],
+        ) -> Result<Self, crate::errors::XmlReadError>
+        where
+            Self: Sized,
+        {
+            read_list_tag(event_reader, element_name, REFERENCE_TAG).map(ExternalReferences)
+        }
+    }
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq)]
+    #[serde(rename_all = "camelCase")]
+    pub(crate) struct ExternalReference {
+        #[serde(rename = "type")]
+        external_reference_type: String,
+        url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        comment: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hashes: Option<Hashes>,
+    }
+
+    impl From<models::external_reference::ExternalReference> for ExternalReference {
+        fn from(other: models::external_reference::ExternalReference) -> Self {
+            Self {
+                external_reference_type: other.external_reference_type.to_string(),
+                url: other.url.to_string(),
+                comment: other.comment,
+                hashes: convert_optional(other.hashes),
+            }
+        }
+    }
+
+    impl From<ExternalReference> for models::external_reference::ExternalReference {
+        fn from(other: ExternalReference) -> Self {
+            Self {
+                external_reference_type:
+                    models::external_reference::ExternalReferenceType::new_unchecked(
+                        other.external_reference_type,
+                    ),
+                url: crate::prelude::Uri(other.url).into(),
+                comment: other.comment,
+                hashes: convert_optional(other.hashes),
+            }
+        }
+    }
+
+    const REFERENCE_TAG: &str = "reference";
+    const TYPE_ATTR: &str = "type";
+    const URL_TAG: &str = "url";
+    const COMMENT_TAG: &str = "comment";
+
+    impl ToXml for ExternalReference {
+        fn write_xml_element<W: std::io::Write>(
+            &self,
+            writer: &mut xml::EventWriter<W>,
+        ) -> Result<(), crate::errors::XmlWriteError> {
+            writer
+                .write(
+                    XmlEvent::start_element(REFERENCE_TAG)
+                        .attr(TYPE_ATTR, &self.external_reference_type),
+                )
+                .map_err(to_xml_write_error(REFERENCE_TAG))?;
+
+            write_simple_tag(writer, URL_TAG, &self.url)?;
+
+            if let Some(comment) = &self.comment {
+                write_simple_tag(writer, COMMENT_TAG, comment)?;
+            }
+
+            if let Some(hashes) = &self.hashes {
+                hashes.write_xml_element(writer)?;
+            }
+
+            writer
+                .write(XmlEvent::end_element())
+                .map_err(to_xml_write_error(REFERENCE_TAG))?;
+
+            Ok(())
+        }
+    }
+
+    const HASHES_TAG: &str = "hashes";
+
+    impl FromXml for ExternalReference {
+        fn read_xml_element<R: std::io::Read>(
+            event_reader: &mut xml::EventReader<R>,
+            element_name: &xml::name::OwnedName,
+            attributes: &[xml::attribute::OwnedAttribute],
+        ) -> Result<Self, XmlReadError>
+        where
+            Self: Sized,
+        {
+            let reference_type = attribute_or_error(element_name, attributes, TYPE_ATTR)?;
+            let mut url: Option<String> = None;
+            let mut comment: Option<String> = None;
+            let mut hashes: Option<Hashes> = None;
+
+            let mut got_end_tag = false;
+            while !got_end_tag {
+                let next_element = event_reader
+                    .next()
+                    .map_err(to_xml_read_error(REFERENCE_TAG))?;
+                match next_element {
+                    reader::XmlEvent::StartElement { name, .. } if name.local_name == URL_TAG => {
+                        url = Some(read_simple_tag(event_reader, &name)?);
+                    }
+                    reader::XmlEvent::StartElement { name, .. }
+                        if name.local_name == COMMENT_TAG =>
+                    {
+                        comment = Some(read_simple_tag(event_reader, &name)?);
+                    }
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == HASHES_TAG => {
+                        hashes = Some(Hashes::read_xml_element(event_reader, &name, &attributes)?)
+                    }
+                    reader::XmlEvent::EndElement { name } if &name == element_name => {
+                        got_end_tag = true;
+                    }
+                    unexpected => return Err(unexpected_element_error(element_name, unexpected)),
+                }
+            }
+
+            let url = url.ok_or_else(|| XmlReadError::RequiredDataMissing {
+                required_field: URL_TAG.to_string(),
+                element: element_name.local_name.to_string(),
+            })?;
+
+            Ok(Self {
+                external_reference_type: reference_type,
+                url,
+                comment,
+                hashes,
+            })
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) mod test {
+        use super::*;
+        use crate::{
+            external_models,
+            specs::common::hash::test::{corresponding_hashes, example_hashes},
+            xml::test::{read_element_from_string, write_element_to_string},
         };
 
-        assert!(external_reference
-            .validate_version(SpecVersion::V1_5)
-            .passed());
-        assert!(external_reference
-            .validate_version(SpecVersion::V1_4)
-            .has_errors());
-        assert!(external_reference
-            .validate_version(SpecVersion::V1_3)
-            .has_errors());
-    }
+        pub(crate) fn example_external_references() -> ExternalReferences {
+            ExternalReferences(vec![example_external_reference()])
+        }
 
-    #[test]
-    fn it_should_pass_validation() {
-        let validation_result = ExternalReferences(vec![
-            ExternalReference {
-                external_reference_type: ExternalReferenceType::Bom,
-                url: Uri::Url(Url("https://example.com".to_string())),
-                comment: Some("Comment".to_string()),
-                hashes: Some(Hashes(vec![])),
-            },
-            ExternalReference {
-                external_reference_type: ExternalReferenceType::Bom,
-                url: Uri::BomLink(BomLink(
-                    "urn:cdx:f08a6ccd-4dce-4759-bd84-c626675d60a7/1".to_string(),
-                )),
-                comment: Some("Comment".to_string()),
-                hashes: Some(Hashes(vec![])),
-            },
-            ExternalReference {
-                external_reference_type: ExternalReferenceType::Bom,
-                url: Uri::BomLink(BomLink(
-                    "urn:cdx:f08a6ccd-4dce-4759-bd84-c626675d60a7/1#componentA".to_string(),
-                )),
-                comment: Some("Comment".to_string()),
-                hashes: Some(Hashes(vec![])),
-            },
-        ])
-        .validate_version(SpecVersion::V1_5);
+        pub(crate) fn corresponding_external_references(
+        ) -> models::external_reference::ExternalReferences {
+            models::external_reference::ExternalReferences(vec![corresponding_external_reference()])
+        }
 
-        assert!(validation_result.passed());
-    }
-
-    #[test]
-    fn it_should_fail_validation() {
-        let validation_result = ExternalReferences(vec![
+        pub(crate) fn example_external_reference() -> ExternalReference {
             ExternalReference {
-                external_reference_type: ExternalReferenceType::UnknownExternalReferenceType(
-                    "unknown reference type".to_string(),
-                ),
-                url: Uri::Url(Url("invalid uri".to_string())),
-                comment: Some("Comment".to_string()),
-                hashes: Some(Hashes(vec![Hash {
-                    alg: crate::models::hash::HashAlgorithm::MD5,
-                    content: HashValue("invalid hash".to_string()),
-                }])),
-            },
-            ExternalReference {
-                external_reference_type: ExternalReferenceType::UnknownExternalReferenceType(
-                    "unknown reference type".to_string(),
-                ),
-                url: Uri::BomLink(BomLink("invalid bom-link".to_string())),
-                comment: Some("Comment".to_string()),
-                hashes: Some(Hashes(vec![Hash {
-                    alg: crate::models::hash::HashAlgorithm::MD5,
-                    content: HashValue("invalid hash".to_string()),
-                }])),
-            },
-        ])
-        .validate_version(SpecVersion::V1_5);
+                external_reference_type: "external reference type".to_string(),
+                url: "url".to_string(),
+                comment: Some("comment".to_string()),
+                hashes: Some(example_hashes()),
+            }
+        }
 
-        assert_eq!(
-            validation_result,
-            validation::list(
-                "inner",
-                [
-                    (
-                        0,
-                        vec![
-                            validation::field(
-                                "external_reference_type",
-                                "Unknown external reference type"
-                            ),
-                            validation::field("url", "Uri does not conform to RFC 3986"),
-                            validation::list(
-                                "hashes",
-                                [(
-                                    0,
-                                    validation::list(
-                                        "inner",
-                                        [(
-                                            0,
-                                            validation::field(
-                                                "content",
-                                                "HashValue does not match regular expression"
-                                            )
-                                        )]
-                                    )
-                                )]
-                            )
-                        ]
+        pub(crate) fn corresponding_external_reference(
+        ) -> models::external_reference::ExternalReference {
+            models::external_reference::ExternalReference {
+                external_reference_type:
+                    models::external_reference::ExternalReferenceType::UnknownExternalReferenceType(
+                        "external reference type".to_string(),
                     ),
-                    (
-                        1,
-                        vec![
-                            validation::field(
-                                "external_reference_type",
-                                "Unknown external reference type"
-                            ),
-                            validation::field("url", "Invalid BOM-Link"),
-                            validation::list(
-                                "hashes",
-                                [(
-                                    0,
-                                    validation::list(
-                                        "inner",
-                                        [(
-                                            0,
-                                            validation::field(
-                                                "content",
-                                                "HashValue does not match regular expression"
-                                            )
-                                        )]
-                                    )
-                                )]
-                            )
-                        ]
-                    )
-                ]
-            )
-        );
+                url: models::external_reference::Uri::Url(external_models::uri::Uri(
+                    "url".to_string(),
+                )),
+                comment: Some("comment".to_string()),
+                hashes: Some(corresponding_hashes()),
+            }
+        }
+
+        #[test]
+        fn it_should_write_xml_full() {
+            let xml_output = write_element_to_string(example_external_references());
+            insta::assert_snapshot!(xml_output);
+        }
+
+        #[test]
+        fn it_should_read_xml_full() {
+            let input = r#"
+<externalReferences>
+  <reference type="external reference type">
+    <url>url</url>
+    <comment>comment</comment>
+    <hashes>
+      <hash alg="algorithm">hash value</hash>
+    </hashes>
+  </reference>
+</externalReferences>
+"#;
+            let actual: ExternalReferences = read_element_from_string(input);
+            let expected = example_external_references();
+            assert_eq!(actual, expected);
+        }
     }
 }

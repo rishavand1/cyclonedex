@@ -16,240 +16,577 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use crate::external_models::normalized_string::{validate_normalized_string, NormalizedString};
-use crate::models::hash::Hashes;
-use crate::validation::{Validate, ValidationContext, ValidationResult};
+use cyclonedx_bom_macros::versioned;
 
-use super::bom::SpecVersion;
-use super::component::Components;
-use super::external_reference::ExternalReferences;
-use super::service::Services;
-
-/// Defines the creation tool(s)
-///
-/// In version 1.5 the type of this property changed to
-/// https://cyclonedx.org/docs/1.5/json/#metadata_tools_oneOf_i0_services .
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Tools {
-    /// Legacy https://cyclonedx.org/docs/1.4/json/#metadata_tools
-    List(Vec<Tool>),
-
-    /// Added in 1.5
-    Object {
-        services: Option<Services>,
-        components: Option<Components>,
-    },
-}
-
-impl Validate for Tools {
-    fn validate_version(&self, version: SpecVersion) -> ValidationResult {
-        let mut context = ValidationContext::new();
-
-        if version <= SpecVersion::V1_4 && !matches!(self, Tools::List(_)) {
-            return ValidationContext::new()
-                .add_custom("inner", "Unsupported tools type found.")
-                .into();
-        }
-
-        match self {
-            Tools::List(tools) => {
-                context.add_list("inner", tools, |tool| tool.validate_version(version));
-            }
-            Tools::Object {
-                services,
-                components,
-            } => {
-                context.add_struct_option("components", components.as_ref(), version);
-                context.add_struct_option("services", services.as_ref(), version);
-            }
-        }
-
-        context.into()
-    }
-}
-
-/// Represents the tool used to create the BOM
-///
-/// Defined via the [CycloneDX XML schema](https://cyclonedx.org/docs/1.3/xml/#type_toolType)
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Tool {
-    pub vendor: Option<NormalizedString>,
-    pub name: Option<NormalizedString>,
-    pub version: Option<NormalizedString>,
-    pub hashes: Option<Hashes>,
-    /// Added in spec version 1.4
-    pub external_references: Option<ExternalReferences>,
-}
-
-impl Tool {
-    /// Construct a `Tool` with the vendor, name, and version
-    /// ```
-    /// use cyclonedx_bom::models::tool::Tool;
-    ///
-    /// let tool = Tool::new("CycloneDX", "cargo-cyclonedx", "1.0.0");
-    /// ```
-    pub fn new(vendor: &str, name: &str, version: &str) -> Self {
-        Self {
-            vendor: Some(NormalizedString::new(vendor)),
-            name: Some(NormalizedString::new(name)),
-            version: Some(NormalizedString::new(version)),
-            hashes: None,
-            external_references: None,
-        }
-    }
-}
-
-impl Validate for Tool {
-    fn validate_version(&self, version: SpecVersion) -> ValidationResult {
-        ValidationContext::new()
-            .add_field_option("vendor", self.vendor.as_ref(), validate_normalized_string)
-            .add_field_option("name", self.name.as_ref(), validate_normalized_string)
-            .add_field_option("version", self.version.as_ref(), validate_normalized_string)
-            .add_list("hashes", &self.hashes, |hashes| {
-                hashes.validate_version(version)
-            })
-            .add_struct_option(
-                "external_references",
-                self.external_references.as_ref(),
-                version,
-            )
-            .into()
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use pretty_assertions::assert_eq;
-
-    use crate::{
-        models::{
-            bom::SpecVersion,
-            component::Classification,
-            service::{Service, Services},
-            tool::{Tool, Tools},
-        },
-        prelude::{Component, Components, NormalizedString, Validate},
-        validation,
+#[versioned("1.3", "1.4", "1.5")]
+pub(crate) mod base {
+    #[versioned("1.4")]
+    use crate::specs::v1_4::external_reference::ExternalReferences;
+    #[versioned("1.5")]
+    use crate::specs::v1_5::{
+        component::Components, external_reference::ExternalReferences, service::Services,
     };
 
-    #[test]
-    fn it_should_pass_validation() {
-        let validation_result = Tools::List(vec![Tool {
-            vendor: Some(NormalizedString("no_whitespace".to_string())),
-            name: None,
-            version: None,
-            hashes: None,
-            external_references: None,
-        }])
-        .validate();
+    use crate::models;
+    use crate::{
+        errors::{BomError, XmlReadError},
+        external_models::normalized_string::NormalizedString,
+        specs::common::hash::Hashes,
+        utilities::{convert_optional, convert_vec},
+        xml::{
+            read_lax_validation_tag, read_simple_tag, to_xml_read_error, to_xml_write_error,
+            unexpected_element_error, write_simple_tag, FromXml, ToXml,
+        },
+    };
+    use serde::{Deserialize, Serialize};
+    use xml::{reader, writer};
 
-        assert!(validation_result.passed());
+    #[derive(Debug, Deserialize, Serialize, PartialEq)]
+    #[serde(rename_all = "camelCase", untagged)]
+    pub(crate) enum Tools {
+        /// Legacy version: https://cyclonedx.org/docs/1.4/json/#metadata_tools
+        List(Vec<Tool>),
+        /// Added in 1.5, see https://cyclonedx.org/docs/1.5/json/#metadata_tools
+        #[versioned("1.5")]
+        Object {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            services: Option<Services>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            components: Option<Components>,
+        },
     }
 
-    #[test]
-    fn it_should_fail_validation() {
-        let validation_result = Tools::List(vec![Tool {
-            vendor: Some(NormalizedString("spaces and\ttabs".to_string())),
-            name: None,
-            version: None,
-            hashes: None,
-            external_references: None,
-        }])
-        .validate();
+    impl TryFrom<models::tool::Tools> for Tools {
+        type Error = BomError;
 
-        assert_eq!(
-            validation_result,
-            validation::list(
-                "inner",
-                [(
-                    0,
-                    validation::field(
-                        "vendor",
-                        "NormalizedString contains invalid characters \\r \\n \\t or \\r\\n"
-                    )
-                )]
-            )
-        );
-    }
-
-    #[test]
-    fn it_should_merge_validations_correctly() {
-        let validation_result = Tools::List(vec![
-            Tool {
-                vendor: Some(NormalizedString("no_whitespace".to_string())),
-                name: None,
-                version: None,
-                hashes: None,
-                external_references: None,
-            },
-            Tool {
-                vendor: Some(NormalizedString("spaces and\ttabs".to_string())),
-                name: None,
-                version: None,
-                hashes: None,
-                external_references: None,
-            },
-            Tool {
-                vendor: None,
-                name: Some(NormalizedString("spaces and\ttabs".to_string())),
-                version: None,
-                hashes: None,
-                external_references: None,
-            },
-        ])
-        .validate();
-
-        assert_eq!(
-            validation_result,
-            validation::list(
-                "inner",
-                [
-                    (
-                        1,
-                        validation::field(
-                            "vendor",
-                            "NormalizedString contains invalid characters \\r \\n \\t or \\r\\n"
-                        )
-                    ),
-                    (
-                        2,
-                        validation::field(
-                            "name",
-                            "NormalizedString contains invalid characters \\r \\n \\t or \\r\\n"
-                        )
-                    )
-                ]
-            )
-        );
-    }
-
-    #[test]
-    fn it_should_handle_different_tools() {
-        let tool = Tool::new("A vendor", "cargo-cyclonedx", "0.1");
-        let service = Service::new("service-x", Some("bom-ref".to_string()));
-        let component = Component::new(Classification::Application, "lib-x", "0.1.0", None);
-
-        assert!(Tools::List(vec![tool.clone()])
-            .validate_version(SpecVersion::V1_3)
-            .passed());
-        assert!(Tools::List(vec![tool.clone()])
-            .validate_version(SpecVersion::V1_4)
-            .passed());
-        assert!(Tools::List(vec![tool])
-            .validate_version(SpecVersion::V1_5)
-            .passed());
-
-        assert!(Tools::Object {
-            services: Some(Services(vec![service.clone()])),
-            components: Some(Components(vec![component.clone()]))
+        fn try_from(other: models::tool::Tools) -> Result<Self, Self::Error> {
+            match other {
+                models::tool::Tools::List(tools) => Ok(Self::List(convert_vec(tools))),
+                #[versioned("1.3", "1.4")]
+                models::tool::Tools::Object { .. } => Ok(Self::List(vec![])),
+                #[versioned("1.5")]
+                models::tool::Tools::Object {
+                    services,
+                    components,
+                } => Ok(Self::Object {
+                    services: convert_optional(services),
+                    components: crate::utilities::try_convert_optional(components)?,
+                }),
+            }
         }
-        .validate_version(SpecVersion::V1_4)
-        .has_errors());
-        assert!(Tools::Object {
-            services: Some(Services(vec![service.clone()])),
-            components: Some(Components(vec![component.clone()]))
+    }
+
+    impl From<Tools> for models::tool::Tools {
+        fn from(other: Tools) -> Self {
+            match other {
+                Tools::List(tools) => models::tool::Tools::List(convert_vec(tools)),
+                #[versioned("1.5")]
+                Tools::Object {
+                    services,
+                    components,
+                } => Self::Object {
+                    services: convert_optional(services),
+                    components: convert_optional(components),
+                },
+            }
         }
-        .validate_version(SpecVersion::V1_5)
-        .passed());
+    }
+
+    const TOOLS_TAG: &str = "tools";
+    #[versioned("1.5")]
+    const COMPONENTS_TAG: &str = "components";
+    #[versioned("1.5")]
+    const SERVICES_TAG: &str = "services";
+
+    impl ToXml for Tools {
+        fn write_xml_element<W: std::io::Write>(
+            &self,
+            writer: &mut xml::EventWriter<W>,
+        ) -> Result<(), crate::errors::XmlWriteError> {
+            writer
+                .write(writer::XmlEvent::start_element(TOOLS_TAG))
+                .map_err(to_xml_write_error(TOOLS_TAG))?;
+
+            match self {
+                Tools::List(tools) => {
+                    for tool in tools {
+                        tool.write_xml_element(writer)?;
+                    }
+                }
+                #[versioned("1.5")]
+                Tools::Object {
+                    services,
+                    components,
+                } => {
+                    services.write_xml_element(writer)?;
+                    components.write_xml_element(writer)?;
+                }
+            }
+
+            writer
+                .write(writer::XmlEvent::end_element())
+                .map_err(to_xml_write_error(TOOLS_TAG))?;
+            Ok(())
+        }
+    }
+
+    impl FromXml for Tools {
+        fn read_xml_element<R: std::io::Read>(
+            event_reader: &mut xml::EventReader<R>,
+            element_name: &xml::name::OwnedName,
+            _attributes: &[xml::attribute::OwnedAttribute],
+        ) -> Result<Self, XmlReadError>
+        where
+            Self: Sized,
+        {
+            let mut tools: Option<Vec<Tool>> = None;
+
+            #[versioned("1.5")]
+            let mut components: Option<Components> = None;
+            #[versioned("1.5")]
+            let mut services: Option<Services> = None;
+
+            let mut got_end_tag = false;
+            while !got_end_tag {
+                let next_element = event_reader.next().map_err(to_xml_read_error(TOOL_TAG))?;
+
+                match next_element {
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == TOOL_TAG => {
+                        tools.get_or_insert(Vec::new()).push(Tool::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?);
+                    }
+
+                    #[versioned("1.5")]
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == COMPONENTS_TAG => {
+                        components = Some(Components::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?);
+                    }
+
+                    #[versioned("1.5")]
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == SERVICES_TAG => {
+                        services = Some(Services::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?);
+                    }
+
+                    reader::XmlEvent::EndElement { name } if &name == element_name => {
+                        got_end_tag = true;
+                    }
+                    unexpected => {
+                        return Err(unexpected_element_error(element_name, unexpected));
+                    }
+                }
+            }
+
+            match tools {
+                Some(tools) => {
+                    #[versioned("1.5")]
+                    if components.is_some() || services.is_some() {
+                        return Err(XmlReadError::RequiredDataMissing {
+                            required_field: "tool array or services & components".to_string(),
+                            element: element_name.local_name.to_string(),
+                        });
+                    }
+
+                    Ok(Self::List(tools))
+                }
+                #[versioned("1.3", "1.4")]
+                None => Ok(Self::List(vec![])),
+                #[versioned("1.5")]
+                None => Ok(Self::Object {
+                    services,
+                    components,
+                }),
+            }
+        }
+    }
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq)]
+    #[serde(rename_all = "camelCase")]
+    pub(crate) struct Tool {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        vendor: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hashes: Option<Hashes>,
+        #[versioned("1.4", "1.5")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        external_references: Option<ExternalReferences>,
+    }
+
+    impl From<models::tool::Tool> for Tool {
+        fn from(other: models::tool::Tool) -> Self {
+            Self {
+                vendor: other.vendor.map(|v| v.to_string()),
+                name: other.name.map(|n| n.to_string()),
+                version: other.version.map(|v| v.to_string()),
+                hashes: convert_optional(other.hashes),
+                #[versioned("1.4", "1.5")]
+                external_references: convert_optional(other.external_references),
+            }
+        }
+    }
+
+    impl From<Tool> for models::tool::Tool {
+        fn from(other: Tool) -> Self {
+            Self {
+                vendor: other.vendor.map(NormalizedString::new_unchecked),
+                name: other.name.map(NormalizedString::new_unchecked),
+                version: other.version.map(NormalizedString::new_unchecked),
+                hashes: convert_optional(other.hashes),
+                #[versioned("1.3")]
+                external_references: None,
+                #[versioned("1.4", "1.5")]
+                external_references: convert_optional(other.external_references),
+            }
+        }
+    }
+
+    const TOOL_TAG: &str = "tool";
+    const VENDOR_TAG: &str = "vendor";
+    const NAME_TAG: &str = "name";
+    const VERSION_TAG: &str = "version";
+
+    impl ToXml for Tool {
+        fn write_xml_element<W: std::io::Write>(
+            &self,
+            writer: &mut xml::EventWriter<W>,
+        ) -> Result<(), crate::errors::XmlWriteError> {
+            writer
+                .write(writer::XmlEvent::start_element(TOOL_TAG))
+                .map_err(to_xml_write_error(TOOL_TAG))?;
+
+            if let Some(vendor) = &self.vendor {
+                write_simple_tag(writer, VENDOR_TAG, vendor)?;
+            }
+
+            if let Some(name) = &self.name {
+                write_simple_tag(writer, NAME_TAG, name)?;
+            }
+
+            if let Some(version) = &self.version {
+                write_simple_tag(writer, VERSION_TAG, version)?;
+            }
+
+            if let Some(hashes) = &self.hashes {
+                if hashes.will_write() {
+                    hashes.write_xml_element(writer)?;
+                }
+            }
+
+            #[versioned("1.4", "1.5")]
+            if let Some(external_references) = &self.external_references {
+                external_references.write_xml_element(writer)?;
+            }
+
+            writer
+                .write(writer::XmlEvent::end_element())
+                .map_err(to_xml_write_error(TOOL_TAG))?;
+
+            Ok(())
+        }
+
+        fn will_write(&self) -> bool {
+            self.vendor.is_some()
+                || self.name.is_some()
+                || self.version.is_some()
+                || self.hashes.is_some()
+        }
+    }
+
+    const HASHES_TAG: &str = "hashes";
+    #[versioned("1.4", "1.5")]
+    const EXTERNAL_REFERENCES_TAG: &str = "externalReferences";
+
+    impl FromXml for Tool {
+        fn read_xml_element<R: std::io::Read>(
+            event_reader: &mut xml::EventReader<R>,
+            element_name: &xml::name::OwnedName,
+            _attributes: &[xml::attribute::OwnedAttribute],
+        ) -> Result<Self, XmlReadError>
+        where
+            Self: Sized,
+        {
+            let mut vendor: Option<String> = None;
+            let mut tool_name: Option<String> = None;
+            let mut version: Option<String> = None;
+            let mut hashes: Option<Hashes> = None;
+            #[versioned("1.4", "1.5")]
+            let mut external_references: Option<ExternalReferences> = None;
+
+            let mut got_end_tag = false;
+            while !got_end_tag {
+                let next_element = event_reader.next().map_err(to_xml_read_error(TOOL_TAG))?;
+                match next_element {
+                    reader::XmlEvent::StartElement { name, .. }
+                        if name.local_name == VENDOR_TAG =>
+                    {
+                        vendor = Some(read_simple_tag(event_reader, &name)?)
+                    }
+                    reader::XmlEvent::StartElement { name, .. } if name.local_name == NAME_TAG => {
+                        tool_name = Some(read_simple_tag(event_reader, &name)?)
+                    }
+                    reader::XmlEvent::StartElement { name, .. }
+                        if name.local_name == VERSION_TAG =>
+                    {
+                        version = Some(read_simple_tag(event_reader, &name)?)
+                    }
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == HASHES_TAG => {
+                        hashes = Some(Hashes::read_xml_element(event_reader, &name, &attributes)?)
+                    }
+                    #[versioned("1.4", "1.5")]
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == EXTERNAL_REFERENCES_TAG => {
+                        external_references = Some(ExternalReferences::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?)
+                    }
+                    // lax validation of any elements from a different schema
+                    reader::XmlEvent::StartElement { name, .. } => {
+                        read_lax_validation_tag(event_reader, &name)?
+                    }
+                    reader::XmlEvent::EndElement { name } if &name == element_name => {
+                        got_end_tag = true;
+                    }
+                    unexpected => return Err(unexpected_element_error(element_name, unexpected)),
+                }
+            }
+
+            Ok(Self {
+                vendor,
+                name: tool_name,
+                version,
+                hashes,
+                #[versioned("1.4", "1.5")]
+                external_references,
+            })
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) mod test {
+        #[versioned("1.4")]
+        use crate::specs::common::external_reference::v1_4::test::{
+            corresponding_external_references, example_external_references,
+        };
+        #[versioned("1.5")]
+        use crate::specs::{
+            common::{
+                external_reference::v1_5::test::{
+                    corresponding_external_references, example_external_references,
+                },
+                hash::{Hash, HashValue},
+                organization::OrganizationalEntity,
+            },
+            v1_5::{
+                component::{Component, Components},
+                service::{Service, Services},
+            },
+        };
+
+        use crate::{
+            specs::common::hash::test::{corresponding_hashes, example_hashes},
+            xml::test::{read_element_from_string, write_element_to_string},
+        };
+
+        use super::*;
+        use pretty_assertions::assert_eq;
+
+        pub(crate) fn example_tools() -> Tools {
+            Tools::List(vec![example_tool()])
+        }
+
+        pub(crate) fn corresponding_tools() -> models::tool::Tools {
+            models::tool::Tools::List(vec![corresponding_tool()])
+        }
+
+        #[versioned("1.3")]
+        pub(crate) fn example_tool() -> Tool {
+            Tool {
+                vendor: Some("vendor".to_string()),
+                name: Some("name".to_string()),
+                version: Some("version".to_string()),
+                hashes: Some(example_hashes()),
+            }
+        }
+
+        #[versioned("1.3")]
+        pub(crate) fn corresponding_tool() -> models::tool::Tool {
+            models::tool::Tool {
+                vendor: Some(NormalizedString::new_unchecked("vendor".to_string())),
+                name: Some(NormalizedString::new_unchecked("name".to_string())),
+                version: Some(NormalizedString::new_unchecked("version".to_string())),
+                hashes: Some(corresponding_hashes()),
+                external_references: None,
+            }
+        }
+
+        #[versioned("1.4", "1.5")]
+        pub(crate) fn example_tool() -> Tool {
+            Tool {
+                vendor: Some("vendor".to_string()),
+                name: Some("name".to_string()),
+                version: Some("version".to_string()),
+                hashes: Some(example_hashes()),
+                external_references: Some(example_external_references()),
+            }
+        }
+
+        #[versioned("1.4", "1.5")]
+        pub(crate) fn corresponding_tool() -> models::tool::Tool {
+            models::tool::Tool {
+                vendor: Some(NormalizedString::new_unchecked("vendor".to_string())),
+                name: Some(NormalizedString::new_unchecked("name".to_string())),
+                version: Some(NormalizedString::new_unchecked("version".to_string())),
+                hashes: Some(corresponding_hashes()),
+                external_references: Some(corresponding_external_references()),
+            }
+        }
+
+        #[test]
+        fn it_should_write_xml_full() {
+            let xml_output = write_element_to_string(example_tools());
+            insta::assert_snapshot!(xml_output);
+        }
+
+        #[test]
+        fn it_should_read_xml_full() {
+            let input = r#"
+<tools>
+  <tool>
+    <vendor>vendor</vendor>
+    <name>name</name>
+    <version>version</version>
+    <hashes>
+      <hash alg="algorithm">hash value</hash>
+    </hashes>
+    <externalReferences>
+      <reference type="external reference type">
+        <url>url</url>
+        <comment>comment</comment>
+        <hashes>
+          <hash alg="algorithm">hash value</hash>
+        </hashes>
+      </reference>
+    </externalReferences>
+  </tool>
+</tools>
+"#;
+            let actual: Tools = read_element_from_string(input);
+            let expected = example_tools();
+            assert_eq!(actual, expected);
+        }
+
+        #[test]
+        #[versioned("1.5")]
+        fn it_should_read_xml_with_services_and_components() {
+            let input = r#"
+<tools>
+  <components>
+    <component type="application">
+      <group>Awesome Vendor</group>
+      <name>Awesome Tool</name>
+      <version>9.1.2</version>
+      <hashes>
+        <hash alg="SHA-1">abcdefgh</hash>
+      </hashes>
+    </component>
+  </components>
+  <services>
+    <service>
+      <provider>
+        <name>Acme Org</name>
+        <url>https://example.com</url>
+      </provider>
+      <group>com.example</group>
+      <name>Acme Signing Server</name>
+      <description>Signs artifacts</description>
+    </service>
+  </services>
+</tools>
+"#;
+            let actual: Tools = read_element_from_string(input);
+            let service = Service {
+                bom_ref: None,
+                provider: Some(OrganizationalEntity {
+                    bom_ref: None,
+                    name: Some("Acme Org".to_string()),
+                    url: Some(vec!["https://example.com".to_string()]),
+                    contact: None,
+                }),
+                group: Some("com.example".to_string()),
+                name: "Acme Signing Server".to_string(),
+                version: None,
+                description: Some("Signs artifacts".to_string()),
+                endpoints: None,
+                authenticated: None,
+                x_trust_boundary: None,
+                data: None,
+                licenses: None,
+                external_references: None,
+                properties: None,
+                services: None,
+                signature: None,
+                trust_zone: None,
+            };
+            let component = Component {
+                component_type: "application".to_string(),
+                mime_type: None,
+                bom_ref: None,
+                supplier: None,
+                author: None,
+                publisher: None,
+                group: Some("Awesome Vendor".to_string()),
+                name: "Awesome Tool".to_string(),
+                version: Some("9.1.2".to_string()),
+                description: None,
+                scope: None,
+                hashes: Some(Hashes(vec![Hash {
+                    alg: "SHA-1".to_string(),
+                    content: HashValue("abcdefgh".to_string()),
+                }])),
+                licenses: None,
+                copyright: None,
+                cpe: None,
+                purl: None,
+                swid: None,
+                modified: None,
+                pedigree: None,
+                external_references: None,
+                properties: None,
+                components: None,
+                evidence: None,
+                signature: None,
+                model_card: None,
+                data: None,
+            };
+            let expected = Tools::Object {
+                services: Some(Services(vec![service])),
+                components: Some(Components(vec![component])),
+            };
+            assert_eq!(actual, expected);
+        }
     }
 }

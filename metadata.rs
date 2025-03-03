@@ -16,327 +16,948 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use thiserror::Error;
+use cyclonedx_bom_macros::versioned;
 
-use crate::external_models::date_time::{DateTime, DateTimeError};
-use crate::external_models::validate_date_time;
-use crate::models::component::Component;
-use crate::models::license::Licenses;
-use crate::models::lifecycle::Lifecycles;
-use crate::models::organization::{OrganizationalContact, OrganizationalEntity};
-use crate::models::property::Properties;
-use crate::models::tool::Tools;
-use crate::validation::{Validate, ValidationContext, ValidationResult};
-
-use super::bom::SpecVersion;
-
-/// Represents additional information about a BOM
-///
-/// Defined via the [CycloneDX XML schema](https://cyclonedx.org/docs/1.3/xml/#type_metadata)
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Metadata {
-    pub timestamp: Option<DateTime>,
-    pub tools: Option<Tools>,
-    pub authors: Option<Vec<OrganizationalContact>>,
-    pub component: Option<Component>,
-    pub manufacture: Option<OrganizationalEntity>,
-    pub supplier: Option<OrganizationalEntity>,
-    pub licenses: Option<Licenses>,
-    pub properties: Option<Properties>,
-    /// Added in 1.5
-    pub lifecycles: Option<Lifecycles>,
-}
-
-impl Metadata {
-    /// Constructs a new `Metadata` with a timestamp based on the current time
-    /// ```
-    /// use cyclonedx_bom::models::metadata::{Metadata, MetadataError};
-    ///
-    /// let metadata = Metadata::new()?;
-    /// # Ok::<(), MetadataError>(())
-    /// ```
-    /// # Errors
-    ///
-    /// Returns an error variant if unable to generate a valid timestamp
-    pub fn new() -> Result<Self, MetadataError> {
-        match DateTime::now() {
-            Ok(timestamp) => Ok(Self {
-                timestamp: Some(timestamp),
-                ..Default::default()
-            }),
-            Err(e) => Err(MetadataError::InvalidTimestamp(e)),
-        }
-    }
-}
-
-impl Validate for Metadata {
-    fn validate_version(&self, version: SpecVersion) -> ValidationResult {
-        ValidationContext::new()
-            .add_field_option("timestamp", self.timestamp.as_ref(), validate_date_time)
-            .add_list("tools", self.tools.as_ref(), |tools| {
-                tools.validate_version(version)
-            })
-            .add_list_option("authors", self.authors.as_ref(), |author| {
-                author.validate_version(version)
-            })
-            .add_struct_option("component", self.component.as_ref(), version)
-            .add_struct_option("manufacture", self.manufacture.as_ref(), version)
-            .add_struct_option("supplier", self.supplier.as_ref(), version)
-            .add_list("licenses", self.licenses.as_ref(), |license| {
-                license.validate_version(version)
-            })
-            .add_list("properties", self.properties.as_ref(), |property| {
-                property.validate_version(version)
-            })
-            .into()
-    }
-}
-
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum MetadataError {
-    #[error("Invalid timestamp")]
-    InvalidTimestamp(#[from] DateTimeError),
-}
-
-#[cfg(test)]
-mod test {
-    use crate::{
-        external_models::{normalized_string::NormalizedString, spdx::SpdxExpression},
-        models::{
-            bom::BomReference,
-            component::Classification,
-            license::LicenseChoice,
-            lifecycle::{Description, Lifecycle, Phase},
-            property::Property,
-            tool::Tool,
-        },
-        validation,
+#[versioned("1.3", "1.4", "1.5")]
+pub(crate) mod base {
+    #[versioned("1.3")]
+    use crate::specs::v1_3::{component::Component, license::Licenses, tool::Tools};
+    #[versioned("1.4")]
+    use crate::specs::v1_4::{component::Component, license::Licenses, tool::Tools};
+    #[versioned("1.5")]
+    use crate::specs::v1_5::{
+        component::Component, license::Licenses, lifecycles::Lifecycles, tool::Tools,
     };
 
-    use super::*;
-    use pretty_assertions::assert_eq;
+    use crate::errors::BomError;
+    use crate::xml::{write_close_tag, write_start_tag};
+    use crate::{
+        external_models::date_time::DateTime,
+        models,
+        specs::common::{
+            organization::OrganizationalContact, organization::OrganizationalEntity,
+            property::Properties,
+        },
+        utilities::{convert_optional, convert_optional_vec, try_convert_optional},
+        xml::{
+            read_lax_validation_tag, read_list_tag, read_simple_tag, to_xml_read_error,
+            unexpected_element_error, write_simple_tag, FromXml, ToInnerXml, ToXml,
+        },
+    };
+    use serde::{Deserialize, Serialize};
+    use std::convert::TryFrom;
+    use xml::reader;
 
-    #[test]
-    fn valid_metadata_should_pass_validation() {
-        let validation_result = Metadata {
-            timestamp: Some(DateTime("1969-06-28T01:20:00.00-04:00".to_string())),
-            tools: Some(Tools::List(vec![Tool {
-                vendor: Some(NormalizedString::new("vendor")),
-                name: None,
-                version: None,
-                hashes: None,
-                external_references: None,
-            }])),
-            authors: Some(vec![OrganizationalContact {
-                bom_ref: None,
-                name: Some(NormalizedString::new("name")),
-                email: None,
-                phone: None,
-            }]),
-            component: Some(Component {
-                component_type: Classification::Application,
-                mime_type: None,
-                bom_ref: None,
-                supplier: None,
-                author: None,
-                publisher: None,
-                group: None,
-                name: NormalizedString::new("name"),
-                version: Some(NormalizedString::new("version")),
-                description: None,
-                scope: None,
-                hashes: None,
-                licenses: None,
-                copyright: None,
-                cpe: None,
-                purl: None,
-                swid: None,
-                modified: None,
-                pedigree: None,
-                external_references: None,
-                properties: None,
-                components: None,
-                evidence: None,
-                signature: None,
-                model_card: None,
-                data: None,
-            }),
-            manufacture: Some(OrganizationalEntity {
-                bom_ref: Some(BomReference::new("Manufacturer")),
-                name: Some(NormalizedString::new("name")),
-                url: None,
-                contact: None,
-            }),
-            supplier: Some(OrganizationalEntity {
-                bom_ref: Some(BomReference::new("Supplier")),
-                name: Some(NormalizedString::new("name")),
-                url: None,
-                contact: None,
-            }),
-            licenses: Some(Licenses(vec![LicenseChoice::Expression(
-                SpdxExpression::new("MIT"),
-            )])),
-            properties: Some(Properties(vec![Property {
-                name: "name".to_string(),
-                value: NormalizedString::new("value"),
-            }])),
-            lifecycles: Some(Lifecycles(vec![Lifecycle::Phase(Phase::Build)])),
-        }
-        .validate();
-
-        assert!(validation_result.passed());
+    #[derive(Debug, Deserialize, Serialize, PartialEq)]
+    #[serde(rename_all = "camelCase")]
+    pub(crate) struct Metadata {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tools: Option<Tools>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        authors: Option<Vec<OrganizationalContact>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        component: Option<Component>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        manufacture: Option<OrganizationalEntity>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        supplier: Option<OrganizationalEntity>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        licenses: Option<Licenses>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        properties: Option<Properties>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[versioned("1.5")]
+        lifecycles: Option<Lifecycles>,
     }
 
-    #[test]
-    fn invalid_metadata_should_fail_validation() {
-        let validation_result = Metadata {
-            timestamp: Some(DateTime("invalid date".to_string())),
-            tools: Some(Tools::List(vec![Tool {
-                vendor: Some(NormalizedString("invalid\tvendor".to_string())),
-                name: None,
-                version: None,
-                hashes: None,
-                external_references: None,
-            }])),
-            authors: Some(vec![OrganizationalContact {
-                bom_ref: None,
-                name: Some(NormalizedString("invalid\tname".to_string())),
-                email: None,
-                phone: None,
-            }]),
-            component: Some(Component {
-                component_type: Classification::UnknownClassification("unknown".to_string()),
-                mime_type: None,
-                bom_ref: None,
-                supplier: None,
-                author: None,
-                publisher: None,
-                group: None,
-                name: NormalizedString::new("name"),
-                version: Some(NormalizedString::new("version")),
-                description: None,
-                scope: None,
-                hashes: None,
-                licenses: None,
-                copyright: None,
-                cpe: None,
-                purl: None,
-                swid: None,
-                modified: None,
-                pedigree: None,
-                external_references: None,
-                properties: None,
-                components: None,
-                evidence: None,
-                signature: None,
-                model_card: None,
-                data: None,
-            }),
-            manufacture: Some(OrganizationalEntity {
-                bom_ref: Some(BomReference::new("Manufacturer")),
-                name: Some(NormalizedString("invalid\tname".to_string())),
-                url: None,
-                contact: None,
-            }),
-            supplier: Some(OrganizationalEntity {
-                bom_ref: Some(BomReference::new("Supplier")),
-                name: Some(NormalizedString("invalid\tname".to_string())),
-                url: None,
-                contact: None,
-            }),
-            licenses: Some(Licenses(vec![LicenseChoice::Expression(
-                SpdxExpression::new("invalid license"),
-            )])),
-            properties: Some(Properties(vec![Property {
-                name: "name".to_string(),
-                value: NormalizedString("invalid\tvalue".to_string()),
-            }])),
-            lifecycles: Some(Lifecycles(vec![Lifecycle::Description(Description {
-                name: "lifecycle".into(),
-                description: Some(NormalizedString("invalid\tvalue".to_string())),
-            })])),
-        }
-        .validate();
+    impl TryFrom<models::metadata::Metadata> for Metadata {
+        type Error = BomError;
 
-        assert_eq!(
-            validation_result,
-            vec![
-                validation::field("timestamp", "DateTime does not conform to ISO 8601"),
-                validation::list(
-                    "tools",
-                    [(
-                        0,
-                        validation::list(
-                            "inner",
-                            [(
-                                0,
-                                validation::field(
-                                    "vendor",
-                                    "NormalizedString contains invalid characters \\r \\n \\t or \\r\\n"
-                                )
-                            )]
-                        )
-                    )]
-                ),
-                validation::list(
-                    "authors",
-                    [(
-                        0,
-                        validation::field(
-                            "name",
-                            "NormalizedString contains invalid characters \\r \\n \\t or \\r\\n"
-                        )
-                    )]
-                ),
-                validation::r#struct(
-                    "component",
-                    validation::field("component_type", "Unknown classification")
-                ),
-                validation::r#struct(
-                    "manufacture",
-                    validation::field(
-                        "name",
-                        "NormalizedString contains invalid characters \\r \\n \\t or \\r\\n"
-                    )
-                ),
-                validation::r#struct(
-                    "supplier",
-                    validation::field(
-                        "name",
-                        "NormalizedString contains invalid characters \\r \\n \\t or \\r\\n"
-                    )
-                ),
-                validation::list(
-                    "licenses",
-                    [(
-                        0,
-                        validation::list(
-                            "inner",
-                            [(
-                                0,
-                                validation::r#enum("expression", "SPDX expression is not valid")
-                            )]
-                        )
-                    )]
-                ),
-                validation::list(
-                    "properties",
-                    [(
-                        0,
-                        validation::list(
-                            "inner",
-                            [(
-                                0,
-                                validation::field(
-                                    "value",
-                                    "NormalizedString contains invalid characters \\r \\n \\t or \\r\\n"
-                                )
-                            )]
-                        )
-                    )]
-                )
-            ]
-            .into()
-        );
+        fn try_from(other: models::metadata::Metadata) -> Result<Self, Self::Error> {
+            Ok(Self {
+                timestamp: other.timestamp.map(|t| t.to_string()),
+                tools: try_convert_optional(other.tools)?,
+                authors: convert_optional_vec(other.authors),
+                component: try_convert_optional(other.component)?,
+                manufacture: convert_optional(other.manufacture),
+                supplier: convert_optional(other.supplier),
+                licenses: convert_optional(other.licenses),
+                properties: convert_optional(other.properties),
+                #[versioned("1.5")]
+                lifecycles: convert_optional(other.lifecycles),
+            })
+        }
+    }
+
+    impl From<Metadata> for models::metadata::Metadata {
+        fn from(other: Metadata) -> Self {
+            Self {
+                timestamp: other.timestamp.map(DateTime),
+                tools: convert_optional(other.tools),
+                authors: convert_optional_vec(other.authors),
+                component: convert_optional(other.component),
+                manufacture: convert_optional(other.manufacture),
+                supplier: convert_optional(other.supplier),
+                licenses: convert_optional(other.licenses),
+                properties: convert_optional(other.properties),
+                #[versioned("1.3", "1.4")]
+                lifecycles: None,
+                #[versioned("1.5")]
+                lifecycles: convert_optional(other.lifecycles),
+            }
+        }
+    }
+
+    const METADATA_TAG: &str = "metadata";
+    const TIMESTAMP_TAG: &str = "timestamp";
+    const AUTHORS_TAG: &str = "authors";
+    const AUTHOR_TAG: &str = "author";
+    const MANUFACTURE_TAG: &str = "manufacture";
+    const SUPPLIER_TAG: &str = "supplier";
+
+    impl ToXml for Metadata {
+        fn write_xml_element<W: std::io::Write>(
+            &self,
+            writer: &mut xml::EventWriter<W>,
+        ) -> Result<(), crate::errors::XmlWriteError> {
+            write_start_tag(writer, METADATA_TAG)?;
+
+            if let Some(timestamp) = &self.timestamp {
+                write_simple_tag(writer, TIMESTAMP_TAG, timestamp)?;
+            }
+
+            if let Some(tools) = &self.tools {
+                tools.write_xml_element(writer)?;
+            }
+
+            if let Some(authors) = &self.authors {
+                write_start_tag(writer, AUTHORS_TAG)?;
+
+                for author in authors {
+                    if author.will_write() {
+                        author.write_xml_named_element(writer, AUTHOR_TAG)?;
+                    }
+                }
+
+                write_close_tag(writer, AUTHORS_TAG)?;
+            }
+
+            if let Some(component) = &self.component {
+                component.write_xml_element(writer)?;
+            }
+
+            if let Some(manufacture) = &self.manufacture {
+                manufacture.write_xml_named_element(writer, MANUFACTURE_TAG)?
+            }
+
+            if let Some(supplier) = &self.supplier {
+                supplier.write_xml_named_element(writer, SUPPLIER_TAG)?;
+            }
+
+            if let Some(licenses) = &self.licenses {
+                licenses.write_xml_element(writer)?;
+            }
+
+            if let Some(properties) = &self.properties {
+                properties.write_xml_element(writer)?;
+            }
+
+            #[versioned("1.5")]
+            if let Some(lifecycles) = &self.lifecycles {
+                lifecycles.write_xml_element(writer)?;
+            }
+
+            write_close_tag(writer, METADATA_TAG)?;
+
+            Ok(())
+        }
+
+        fn will_write(&self) -> bool {
+            self.timestamp.is_some()
+                || self.tools.is_some()
+                || self.authors.is_some()
+                || self.component.is_some()
+                || self.manufacture.is_some()
+                || self.supplier.is_some()
+                || self.licenses.is_some()
+                || self.properties.is_some()
+        }
+    }
+
+    const TOOLS_TAG: &str = "tools";
+    const COMPONENT_TAG: &str = "component";
+    const LICENSES_TAG: &str = "licenses";
+    const PROPERTIES_TAG: &str = "properties";
+    #[versioned("1.5")]
+    const LIFECYCLES_TAG: &str = "lifecycles";
+
+    impl FromXml for Metadata {
+        fn read_xml_element<R: std::io::Read>(
+            event_reader: &mut xml::EventReader<R>,
+            element_name: &xml::name::OwnedName,
+            _attributes: &[xml::attribute::OwnedAttribute],
+        ) -> Result<Self, crate::errors::XmlReadError>
+        where
+            Self: Sized,
+        {
+            let mut timestamp: Option<String> = None;
+            let mut tools: Option<Tools> = None;
+            let mut authors: Option<Vec<OrganizationalContact>> = None;
+            let mut component: Option<Component> = None;
+            let mut manufacture: Option<OrganizationalEntity> = None;
+            let mut supplier: Option<OrganizationalEntity> = None;
+            let mut licenses: Option<Licenses> = None;
+            let mut properties: Option<Properties> = None;
+            #[versioned("1.5")]
+            let mut lifecycles: Option<Lifecycles> = None;
+
+            let mut got_end_tag = false;
+            while !got_end_tag {
+                let next_element = event_reader
+                    .next()
+                    .map_err(to_xml_read_error(METADATA_TAG))?;
+                match next_element {
+                    reader::XmlEvent::StartElement { name, .. }
+                        if name.local_name == TIMESTAMP_TAG =>
+                    {
+                        timestamp = Some(read_simple_tag(event_reader, &name)?)
+                    }
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == TOOLS_TAG => {
+                        tools = Some(Tools::read_xml_element(event_reader, &name, &attributes)?)
+                    }
+                    reader::XmlEvent::StartElement { name, .. }
+                        if name.local_name == AUTHORS_TAG =>
+                    {
+                        authors = Some(read_list_tag(event_reader, &name, AUTHOR_TAG)?);
+                    }
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == COMPONENT_TAG => {
+                        component = Some(Component::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?)
+                    }
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == MANUFACTURE_TAG => {
+                        manufacture = Some(OrganizationalEntity::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?)
+                    }
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == SUPPLIER_TAG => {
+                        supplier = Some(OrganizationalEntity::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?)
+                    }
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == LICENSES_TAG => {
+                        licenses = Some(Licenses::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?)
+                    }
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == PROPERTIES_TAG => {
+                        properties = Some(Properties::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?)
+                    }
+                    #[versioned("1.5")]
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == LIFECYCLES_TAG => {
+                        lifecycles = Some(Lifecycles::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?)
+                    }
+                    // lax validation of any elements from a different schema
+                    reader::XmlEvent::StartElement { name, .. } => {
+                        read_lax_validation_tag(event_reader, &name)?
+                    }
+                    reader::XmlEvent::EndElement { name } if &name == element_name => {
+                        got_end_tag = true;
+                    }
+                    unexpected => return Err(unexpected_element_error(element_name, unexpected)),
+                }
+            }
+
+            Ok(Self {
+                timestamp,
+                tools,
+                authors,
+                component,
+                manufacture,
+                supplier,
+                licenses,
+                properties,
+                #[versioned("1.5")]
+                lifecycles,
+            })
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) mod test {
+        use super::*;
+        use pretty_assertions::assert_eq;
+
+        #[versioned("1.3")]
+        use crate::specs::v1_3::{
+            component::test::{corresponding_component, example_component},
+            license::test::{corresponding_licenses, example_licenses},
+            tool::test::{corresponding_tools, example_tools},
+        };
+        #[versioned("1.4")]
+        use crate::specs::v1_4::{
+            component::test::{corresponding_component, example_component},
+            license::test::{corresponding_licenses, example_licenses},
+            tool::test::{corresponding_tools, example_tools},
+        };
+        #[versioned("1.5")]
+        use crate::specs::v1_5::{
+            component::test::{corresponding_component, example_component},
+            license::test::{corresponding_licenses, example_licenses},
+            lifecycles::test::{corresponding_lifecycles, example_lifecycles},
+            tool::test::{corresponding_tools, example_tools},
+        };
+        use crate::{
+            specs::common::{
+                organization::test::{
+                    corresponding_contact, corresponding_entity, example_contact, example_entity,
+                },
+                property::test::{corresponding_properties, example_properties},
+            },
+            xml::test::{read_element_from_string, write_element_to_string},
+        };
+
+        pub(crate) fn example_metadata() -> Metadata {
+            Metadata {
+                timestamp: Some("timestamp".to_string()),
+                tools: Some(example_tools()),
+                authors: Some(vec![example_contact()]),
+                component: Some(example_component()),
+                manufacture: Some(example_entity()),
+                supplier: Some(example_entity()),
+                licenses: Some(example_licenses()),
+                properties: Some(example_properties()),
+                #[versioned("1.5")]
+                lifecycles: Some(example_lifecycles()),
+            }
+        }
+
+        pub(crate) fn corresponding_metadata() -> models::metadata::Metadata {
+            models::metadata::Metadata {
+                timestamp: Some(DateTime("timestamp".to_string())),
+                tools: Some(corresponding_tools()),
+                authors: Some(vec![corresponding_contact()]),
+                component: Some(corresponding_component()),
+                manufacture: Some(corresponding_entity()),
+                supplier: Some(corresponding_entity()),
+                licenses: Some(corresponding_licenses()),
+                properties: Some(corresponding_properties()),
+                #[versioned("1.3", "1.4")]
+                lifecycles: None,
+                #[versioned("1.5")]
+                lifecycles: Some(corresponding_lifecycles()),
+            }
+        }
+
+        #[test]
+        fn it_should_write_xml_full() {
+            let xml_output = write_element_to_string(example_metadata());
+            insta::assert_snapshot!(xml_output);
+        }
+
+        #[test]
+        fn it_should_read_xml_full() {
+            #[versioned("1.3")]
+            let input = r#"
+<metadata>
+  <timestamp>timestamp</timestamp>
+  <tools>
+    <tool>
+      <vendor>vendor</vendor>
+      <name>name</name>
+      <version>version</version>
+      <hashes>
+        <hash alg="algorithm">hash value</hash>
+      </hashes>
+    </tool>
+  </tools>
+  <authors>
+    <author>
+      <name>name</name>
+      <email>email</email>
+      <phone>phone</phone>
+    </author>
+  </authors>
+  <component type="component type" mime-type="mime type" bom-ref="bom ref">
+    <supplier>
+      <name>name</name>
+      <url>url</url>
+      <contact>
+        <name>name</name>
+        <email>email</email>
+        <phone>phone</phone>
+      </contact>
+    </supplier>
+    <author>author</author>
+    <publisher>publisher</publisher>
+    <group>group</group>
+    <name>name</name>
+    <version>version</version>
+    <description>description</description>
+    <scope>scope</scope>
+    <hashes>
+      <hash alg="algorithm">hash value</hash>
+    </hashes>
+    <licenses>
+      <expression>expression</expression>
+    </licenses>
+    <copyright>copyright</copyright>
+    <cpe>cpe</cpe>
+    <purl>purl</purl>
+    <swid tagId="tag id" name="name" version="version" tagVersion="1" patch="true">
+      <text content-type="content type" encoding="encoding">content</text>
+      <url>url</url>
+    </swid>
+    <modified>true</modified>
+    <pedigree>
+      <ancestors />
+      <descendants />
+      <variants />
+      <commits>
+        <commit>
+          <uid>uid</uid>
+          <url>url</url>
+          <author>
+            <timestamp>timestamp</timestamp>
+            <name>name</name>
+            <email>email</email>
+          </author>
+          <committer>
+            <timestamp>timestamp</timestamp>
+            <name>name</name>
+            <email>email</email>
+          </committer>
+          <message>message</message>
+        </commit>
+      </commits>
+      <patches>
+        <patch type="patch type">
+          <diff>
+            <text content-type="content type" encoding="encoding">content</text>
+            <url>url</url>
+          </diff>
+          <resolves>
+            <issue type="issue type">
+              <id>id</id>
+              <name>name</name>
+              <description>description</description>
+              <source>
+                <name>name</name>
+                <url>url</url>
+              </source>
+              <references>
+                <url>reference</url>
+              </references>
+            </issue>
+          </resolves>
+        </patch>
+      </patches>
+      <notes>notes</notes>
+    </pedigree>
+    <externalReferences>
+      <reference type="external reference type">
+        <url>url</url>
+        <comment>comment</comment>
+        <hashes>
+          <hash alg="algorithm">hash value</hash>
+        </hashes>
+      </reference>
+    </externalReferences>
+    <properties>
+      <property name="name">value</property>
+    </properties>
+    <components />
+    <evidence>
+      <licenses>
+        <expression>expression</expression>
+      </licenses>
+      <copyright>
+        <text><![CDATA[copyright]]></text>
+      </copyright>
+    </evidence>
+  </component>
+  <manufacture>
+    <name>name</name>
+    <url>url</url>
+    <contact>
+      <name>name</name>
+      <email>email</email>
+      <phone>phone</phone>
+    </contact>
+  </manufacture>
+  <supplier>
+    <name>name</name>
+    <url>url</url>
+    <contact>
+      <name>name</name>
+      <email>email</email>
+      <phone>phone</phone>
+    </contact>
+  </supplier>
+  <licenses>
+    <expression>expression</expression>
+  </licenses>
+  <properties>
+    <property name="name">value</property>
+  </properties>
+</metadata>
+"#;
+            #[versioned("1.4")]
+            let input = r#"
+<metadata>
+  <timestamp>timestamp</timestamp>
+  <tools>
+    <tool>
+      <vendor>vendor</vendor>
+      <name>name</name>
+      <version>version</version>
+      <hashes>
+        <hash alg="algorithm">hash value</hash>
+      </hashes>
+      <externalReferences>
+        <reference type="external reference type">
+          <url>url</url>
+          <comment>comment</comment>
+          <hashes>
+            <hash alg="algorithm">hash value</hash>
+          </hashes>
+        </reference>
+      </externalReferences>
+    </tool>
+  </tools>
+  <authors>
+    <author>
+      <name>name</name>
+      <email>email</email>
+      <phone>phone</phone>
+    </author>
+  </authors>
+  <component type="component type" mime-type="mime type" bom-ref="bom ref">
+    <supplier>
+      <name>name</name>
+      <url>url</url>
+      <contact>
+        <name>name</name>
+        <email>email</email>
+        <phone>phone</phone>
+      </contact>
+    </supplier>
+    <author>author</author>
+    <publisher>publisher</publisher>
+    <group>group</group>
+    <name>name</name>
+    <version>version</version>
+    <description>description</description>
+    <scope>scope</scope>
+    <hashes>
+      <hash alg="algorithm">hash value</hash>
+    </hashes>
+    <licenses>
+      <expression>expression</expression>
+    </licenses>
+    <copyright>copyright</copyright>
+    <cpe>cpe</cpe>
+    <purl>purl</purl>
+    <swid tagId="tag id" name="name" version="version" tagVersion="1" patch="true">
+      <text content-type="content type" encoding="encoding">content</text>
+      <url>url</url>
+    </swid>
+    <modified>true</modified>
+    <pedigree>
+      <ancestors />
+      <descendants />
+      <variants />
+      <commits>
+        <commit>
+          <uid>uid</uid>
+          <url>url</url>
+          <author>
+            <timestamp>timestamp</timestamp>
+            <name>name</name>
+            <email>email</email>
+          </author>
+          <committer>
+            <timestamp>timestamp</timestamp>
+            <name>name</name>
+            <email>email</email>
+          </committer>
+          <message>message</message>
+        </commit>
+      </commits>
+      <patches>
+        <patch type="patch type">
+          <diff>
+            <text content-type="content type" encoding="encoding">content</text>
+            <url>url</url>
+          </diff>
+          <resolves>
+            <issue type="issue type">
+              <id>id</id>
+              <name>name</name>
+              <description>description</description>
+              <source>
+                <name>name</name>
+                <url>url</url>
+              </source>
+              <references>
+                <url>reference</url>
+              </references>
+            </issue>
+          </resolves>
+        </patch>
+      </patches>
+      <notes>notes</notes>
+    </pedigree>
+    <externalReferences>
+      <reference type="external reference type">
+        <url>url</url>
+        <comment>comment</comment>
+        <hashes>
+          <hash alg="algorithm">hash value</hash>
+        </hashes>
+      </reference>
+    </externalReferences>
+    <properties>
+      <property name="name">value</property>
+    </properties>
+    <components />
+    <evidence>
+      <licenses>
+        <expression>expression</expression>
+      </licenses>
+      <copyright>
+        <text><![CDATA[copyright]]></text>
+      </copyright>
+    </evidence>
+    <signature>
+      <algorithm>HS512</algorithm>
+      <value>1234567890</value>
+    </signature>
+  </component>
+  <manufacture>
+    <name>name</name>
+    <url>url</url>
+    <contact>
+      <name>name</name>
+      <email>email</email>
+      <phone>phone</phone>
+    </contact>
+  </manufacture>
+  <supplier>
+    <name>name</name>
+    <url>url</url>
+    <contact>
+      <name>name</name>
+      <email>email</email>
+      <phone>phone</phone>
+    </contact>
+  </supplier>
+  <licenses>
+    <expression>expression</expression>
+  </licenses>
+  <properties>
+    <property name="name">value</property>
+  </properties>
+</metadata>
+"#;
+            #[versioned("1.5")]
+            let input = r#"
+<metadata>
+  <timestamp>timestamp</timestamp>
+  <tools>
+    <tool>
+      <vendor>vendor</vendor>
+      <name>name</name>
+      <version>version</version>
+      <hashes>
+        <hash alg="algorithm">hash value</hash>
+      </hashes>
+      <externalReferences>
+        <reference type="external reference type">
+          <url>url</url>
+          <comment>comment</comment>
+          <hashes>
+            <hash alg="algorithm">hash value</hash>
+          </hashes>
+        </reference>
+      </externalReferences>
+    </tool>
+  </tools>
+  <authors>
+    <author>
+      <name>name</name>
+      <email>email</email>
+      <phone>phone</phone>
+    </author>
+  </authors>
+  <component type="component type" mime-type="mime type" bom-ref="bom ref">
+    <supplier>
+      <name>name</name>
+      <url>url</url>
+      <contact>
+        <name>name</name>
+        <email>email</email>
+        <phone>phone</phone>
+      </contact>
+    </supplier>
+    <author>author</author>
+    <publisher>publisher</publisher>
+    <group>group</group>
+    <name>name</name>
+    <version>version</version>
+    <description>description</description>
+    <scope>scope</scope>
+    <hashes>
+      <hash alg="algorithm">hash value</hash>
+    </hashes>
+    <licenses>
+      <expression>expression</expression>
+    </licenses>
+    <copyright>copyright</copyright>
+    <cpe>cpe</cpe>
+    <purl>purl</purl>
+    <swid tagId="tag id" name="name" version="version" tagVersion="1" patch="true">
+      <text content-type="content type" encoding="encoding">content</text>
+      <url>url</url>
+    </swid>
+    <modified>true</modified>
+    <pedigree>
+      <ancestors />
+      <descendants />
+      <variants />
+      <commits>
+        <commit>
+          <uid>uid</uid>
+          <url>url</url>
+          <author>
+            <timestamp>timestamp</timestamp>
+            <name>name</name>
+            <email>email</email>
+          </author>
+          <committer>
+            <timestamp>timestamp</timestamp>
+            <name>name</name>
+            <email>email</email>
+          </committer>
+          <message>message</message>
+        </commit>
+      </commits>
+      <patches>
+        <patch type="patch type">
+          <diff>
+            <text content-type="content type" encoding="encoding">content</text>
+            <url>url</url>
+          </diff>
+          <resolves>
+            <issue type="issue type">
+              <id>id</id>
+              <name>name</name>
+              <description>description</description>
+              <source>
+                <name>name</name>
+                <url>url</url>
+              </source>
+              <references>
+                <url>reference</url>
+              </references>
+            </issue>
+          </resolves>
+        </patch>
+      </patches>
+      <notes>notes</notes>
+    </pedigree>
+    <externalReferences>
+      <reference type="external reference type">
+        <url>url</url>
+        <comment>comment</comment>
+        <hashes>
+          <hash alg="algorithm">hash value</hash>
+        </hashes>
+      </reference>
+    </externalReferences>
+    <properties>
+      <property name="name">value</property>
+    </properties>
+    <components />
+    <evidence>
+      <licenses>
+        <expression>expression</expression>
+      </licenses>
+      <copyright>
+        <text><![CDATA[copyright]]></text>
+      </copyright>
+      <occurrences>
+        <occurrence bom-ref="occurrence-1">
+          <location>location-1</location>
+        </occurrence>
+      </occurrences>
+      <callstack>
+        <frame>
+          <frame>
+            <package>package-1</package>
+            <module>module-1</module>
+            <function>function</function>
+            <line>10</line>
+            <column>20</column>
+            <fullFilename>full-filename</fullFilename>
+          </frame>
+        </frame>
+      </callstack>
+      <identity>
+        <field>group</field>
+        <confidence>0.5</confidence>
+        <methods>
+          <method>
+            <technique>technique-1</technique>
+            <confidence>0.8</confidence>
+            <value>identity-value</value>
+          </method>
+        </methods>
+        <tools>
+          <tool ref="tool-ref-1" />
+        </tools>
+      </identity>
+    </evidence>
+    <signature>
+      <algorithm>HS512</algorithm>
+      <value>1234567890</value>
+    </signature>
+    <modelCard bom-ref="modelcard-1">
+      <modelParameters>
+        <approach>
+          <type>supervised</type>
+        </approach>
+        <task>Task</task>
+        <architectureFamily>Architecture</architectureFamily>
+        <modelArchitecture>Model</modelArchitecture>
+        <datasets>
+          <dataset bom-ref="dataset-1">
+            <type>dataset</type>
+            <name>Training Data</name>
+            <contents>
+              <url>https://example.com/path/to/dataset</url>
+            </contents>
+            <classification>public</classification>
+            <governance>
+              <owners>
+                <owner>
+                  <contact bom-ref="contact-1">
+                    <name>Contact</name>
+                    <email>contact@example.com</email>
+                  </contact>
+                </owner>
+              </owners>
+            </governance>
+          </dataset>
+        </datasets>
+        <inputs>
+          <input>
+            <format>string</format>
+          </input>
+        </inputs>
+        <outputs>
+          <output>
+            <format>image</format>
+          </output>
+        </outputs>
+      </modelParameters>
+      <quantitativeAnalysis>
+        <performanceMetrics>
+          <performanceMetric>
+            <type>metric-1</type>
+            <value>metric value</value>
+            <confidenceInterval>
+              <lowerBound>low</lowerBound>
+              <upperBound>high</upperBound>
+            </confidenceInterval>
+          </performanceMetric>
+        </performanceMetrics>
+        <graphics>
+          <description>Graphic Desc</description>
+          <collection>
+            <graphic>
+              <name>Graphic A</name>
+              <image>1234</image>
+            </graphic>
+          </collection>
+        </graphics>
+      </quantitativeAnalysis>
+    </modelCard>
+    <data>
+      <type>configuration</type>
+      <name>config</name>
+      <contents>
+        <attachment>foo: bar</attachment>
+      </contents>
+    </data>
+  </component>
+  <manufacture>
+    <name>name</name>
+    <url>url</url>
+    <contact>
+      <name>name</name>
+      <email>email</email>
+      <phone>phone</phone>
+    </contact>
+  </manufacture>
+  <supplier>
+    <name>name</name>
+    <url>url</url>
+    <contact>
+      <name>name</name>
+      <email>email</email>
+      <phone>phone</phone>
+    </contact>
+  </supplier>
+  <licenses>
+    <expression>expression</expression>
+  </licenses>
+  <properties>
+    <property name="name">value</property>
+  </properties>
+  <lifecycles>
+    <lifecycle>
+      <phase>design</phase>
+    </lifecycle>
+  </lifecycles>
+</metadata>
+"#;
+
+            let actual: Metadata = read_element_from_string(input);
+            let expected = example_metadata();
+            assert_eq!(actual, expected);
+        }
     }
 }

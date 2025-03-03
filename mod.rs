@@ -16,33 +16,25 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-pub mod advisory;
-pub mod annotation;
-pub mod attached_text;
-pub mod attachment;
-pub mod bom;
-pub mod code;
-pub mod component;
-pub mod component_data;
-pub mod composition;
-pub mod data_governance;
-pub mod dependency;
-pub mod external_reference;
-pub mod formulation;
-pub mod hash;
-pub mod license;
-pub mod lifecycle;
-pub mod metadata;
-pub mod modelcard;
-pub mod organization;
-pub mod property;
-pub mod service;
-pub mod signature;
-pub mod tool;
-pub mod vulnerability;
-pub mod vulnerability_analysis;
-pub mod vulnerability_credits;
-pub mod vulnerability_rating;
-pub mod vulnerability_reference;
-pub mod vulnerability_source;
-pub mod vulnerability_target;
+pub(crate) mod annotation;
+pub(crate) mod attachment;
+pub(crate) mod component_data;
+pub(crate) mod data_governance;
+pub(crate) mod evidence;
+pub(crate) mod formulation;
+pub(crate) mod licensing;
+pub(crate) mod lifecycles;
+pub(crate) mod modelcard;
+pub(crate) mod proof_of_concept;
+pub(crate) mod service_data;
+
+pub(crate) use crate::specs::common::bom::v1_5 as bom;
+pub(crate) use crate::specs::common::component::v1_5 as component;
+pub(crate) use crate::specs::common::composition::v1_5 as composition;
+pub(crate) use crate::specs::common::external_reference::v1_5 as external_reference;
+pub(crate) use crate::specs::common::license::v1_5 as license;
+pub(crate) use crate::specs::common::metadata::v1_5 as metadata;
+pub(crate) use crate::specs::common::service::v1_5 as service;
+pub(crate) use crate::specs::common::tool::v1_5 as tool;
+pub(crate) use crate::specs::common::vulnerability::v1_5 as vulnerability;
+pub(crate) use crate::specs::common::vulnerability_analysis::v1_5 as vulnerability_analysis;

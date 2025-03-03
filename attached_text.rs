@@ -16,173 +16,181 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use base64::{engine::general_purpose::STANDARD, Engine};
-
 use crate::{
-    external_models::normalized_string::{validate_normalized_string, NormalizedString},
-    validation::{Validate, ValidationContext, ValidationError, ValidationResult},
+    errors::XmlWriteError,
+    external_models::normalized_string::NormalizedString,
+    xml::{closing_tag_or_error, inner_text_or_error, to_xml_read_error, FromXml, ToInnerXml},
 };
+use crate::{models, xml::to_xml_write_error};
+use serde::{Deserialize, Serialize};
+use xml::writer::{EventWriter, XmlEvent};
 
-use super::bom::SpecVersion;
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct AttachedText {
-    pub content_type: Option<NormalizedString>,
-    pub encoding: Option<Encoding>,
-    pub content: String,
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AttachedText {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding: Option<String>,
+    content: String,
 }
 
-impl AttachedText {
-    /// Construct a new `AttachedText`
-    ///
-    /// - `content_type` - Content type of the attached text (default: `"text/plain"`)
-    /// - `content` - Raw content, which will be base64 encoded when added to the BOM
-    pub fn new<T: AsRef<[u8]>>(content_type: Option<NormalizedString>, content: T) -> Self {
+impl From<models::attached_text::AttachedText> for AttachedText {
+    fn from(other: models::attached_text::AttachedText) -> Self {
         Self {
-            content_type,
-            encoding: Some(Encoding::Base64),
-            content: STANDARD.encode(content),
+            content_type: other.content_type.map(|n| n.0),
+            encoding: other.encoding.map(|e| e.to_string()),
+            content: other.content,
         }
     }
 }
 
-impl Validate for AttachedText {
-    fn validate_version(&self, _version: SpecVersion) -> ValidationResult {
-        let mut context = ValidationContext::new();
-        context.add_field_option(
-            "content_type",
-            self.content_type.as_ref(),
-            validate_normalized_string,
-        );
+impl From<AttachedText> for models::attached_text::AttachedText {
+    fn from(other: AttachedText) -> Self {
+        Self {
+            content_type: other.content_type.map(NormalizedString::new_unchecked),
+            encoding: other
+                .encoding
+                .map(models::attached_text::Encoding::new_unchecked),
+            content: other.content,
+        }
+    }
+}
+
+const CONTENT_TYPE_ATTR: &str = "content-type";
+const ENCODING_ATTR: &str = "encoding";
+
+impl ToInnerXml for AttachedText {
+    fn write_xml_named_element<W: std::io::Write>(
+        &self,
+        writer: &mut EventWriter<W>,
+        tag: &str,
+    ) -> Result<(), XmlWriteError> {
+        let mut attached_text_tag = XmlEvent::start_element(tag);
+
+        if let Some(content_type) = &self.content_type {
+            attached_text_tag = attached_text_tag.attr(CONTENT_TYPE_ATTR, content_type);
+        }
 
         if let Some(encoding) = &self.encoding {
-            match (encoding, STANDARD.decode(self.content.clone())) {
-                (Encoding::Base64, Ok(_)) => (),
-                (Encoding::Base64, Err(_)) => {
-                    context.add_field("content", &self.content, |_| {
-                        Err("Content is not Base64 encoded".into())
-                    });
-                }
-                (Encoding::UnknownEncoding(_), _) => {
-                    context.add_field("encoding", encoding, validate_encoding);
-                }
+            attached_text_tag = attached_text_tag.attr(ENCODING_ATTR, encoding);
+        }
+        writer
+            .write(attached_text_tag)
+            .map_err(to_xml_write_error(tag))?;
+
+        writer
+            .write(XmlEvent::characters(&self.content))
+            .map_err(to_xml_write_error(tag))?;
+        writer
+            .write(XmlEvent::end_element())
+            .map_err(to_xml_write_error(tag))?;
+
+        Ok(())
+    }
+}
+
+impl FromXml for AttachedText {
+    fn read_xml_element<R: std::io::Read>(
+        event_reader: &mut xml::EventReader<R>,
+        element_name: &xml::name::OwnedName,
+        attributes: &[xml::attribute::OwnedAttribute],
+    ) -> Result<Self, crate::errors::XmlReadError>
+    where
+        Self: Sized,
+    {
+        let mut content_type: Option<String> = None;
+        let mut encoding: Option<String> = None;
+
+        for attribute in attributes {
+            match attribute.name.local_name.as_ref() {
+                CONTENT_TYPE_ATTR => content_type = Some(attribute.value.clone()),
+                ENCODING_ATTR => encoding = Some(attribute.value.clone()),
+                _ => (),
             }
         }
 
-        context.into()
-    }
-}
+        let content = event_reader
+            .next()
+            .map_err(to_xml_read_error(&element_name.local_name))
+            .and_then(inner_text_or_error(&element_name.local_name))?;
 
-/// Function to check [`Encoding`].
-pub fn validate_encoding(encoding: &Encoding) -> Result<(), ValidationError> {
-    if matches!(encoding, Encoding::UnknownEncoding(_)) {
-        return Err(ValidationError::new("Unknown encoding"));
-    }
-    Ok(())
-}
+        event_reader
+            .next()
+            .map_err(to_xml_read_error(&element_name.local_name))
+            .and_then(closing_tag_or_error(element_name))?;
 
-#[derive(Clone, Debug, PartialEq, Eq, strum::Display, Hash)]
-#[strum(serialize_all = "kebab-case")]
-pub enum Encoding {
-    Base64,
-    #[doc(hidden)]
-    #[strum(default)]
-    UnknownEncoding(String),
-}
-
-impl Encoding {
-    pub fn new_unchecked<A: AsRef<str>>(value: A) -> Self {
-        match value.as_ref() {
-            "base64" => Self::Base64,
-            unknown => Self::UnknownEncoding(unknown.to_string()),
-        }
+        Ok(Self {
+            content_type,
+            encoding,
+            content,
+        })
     }
 }
 
 #[cfg(test)]
-mod test {
-    use crate::{
-        models::attached_text::{AttachedText, Encoding},
-        prelude::{NormalizedString, Validate},
-        validation,
-    };
+pub(crate) mod test {
+    use super::*;
+    use crate::xml::test::{read_element_from_string, write_named_element_to_string};
 
-    use pretty_assertions::assert_eq;
+    pub(crate) fn example_attached_text() -> AttachedText {
+        AttachedText {
+            content_type: Some("content type".to_string()),
+            encoding: Some("encoding".to_string()),
+            content: "content".to_string(),
+        }
+    }
+
+    pub(crate) fn corresponding_attached_text() -> models::attached_text::AttachedText {
+        models::attached_text::AttachedText {
+            content_type: Some(NormalizedString::new_unchecked("content type".to_string())),
+            encoding: Some(models::attached_text::Encoding::UnknownEncoding(
+                "encoding".to_string(),
+            )),
+            content: "content".to_string(),
+        }
+    }
 
     #[test]
-    fn it_should_construct_attached_text() {
-        let actual = AttachedText::new(
-            Some(NormalizedString::new("text/plain")),
-            "this text is plain",
-        );
-        assert_eq!(
-            actual,
+    fn it_should_write_xml_full() {
+        let xml_output = write_named_element_to_string(example_attached_text(), "text");
+        insta::assert_snapshot!(xml_output);
+    }
+
+    #[test]
+    fn it_should_write_xml_no_attributes() {
+        let xml_output = write_named_element_to_string(
             AttachedText {
-                content_type: Some(NormalizedString::new("text/plain")),
-                encoding: Some(Encoding::Base64),
-                content: "dGhpcyB0ZXh0IGlzIHBsYWlu".to_string(),
-            }
-        )
-    }
-
-    #[test]
-    fn valid_attached_text_should_pass_validation() {
-        let validation_result = AttachedText {
-            content_type: Some(NormalizedString("text/plain".to_string())),
-            encoding: Some(Encoding::Base64),
-            content: "dGhpcyB0ZXh0IGlzIHBsYWlu".to_string(),
-        }
-        .validate();
-
-        assert!(validation_result.passed());
-    }
-
-    #[test]
-    fn invalid_attached_text_should_fail_validation() {
-        let validation_result = AttachedText {
-            content_type: Some(NormalizedString("spaces and \ttabs".to_string())),
-            encoding: Some(Encoding::Base64),
-            content: "not base64 encoded".to_string(),
-        }
-        .validate();
-
-        assert_eq!(
-            validation_result,
-            vec![
-                validation::field(
-                    "content_type",
-                    "NormalizedString contains invalid characters \\r \\n \\t or \\r\\n"
-                ),
-                validation::field("content", "Content is not Base64 encoded")
-            ]
-            .into()
+                content_type: None,
+                encoding: None,
+                content: "content".to_string(),
+            },
+            "text",
         );
+        insta::assert_snapshot!(xml_output);
     }
 
     #[test]
-    fn an_unknown_encoding_should_fail_validation() {
-        let validation_result = AttachedText {
-            content_type: Some(NormalizedString("text/plain".to_string())),
-            encoding: Some(Encoding::UnknownEncoding("unknown".to_string())),
-            content: "not base64 encoded".to_string(),
-        }
-        .validate();
-
-        assert_eq!(
-            validation_result,
-            validation::field("encoding", "Unknown encoding"),
-        );
+    fn it_should_read_xml_full() {
+        let input = r#"
+<text content-type="content type" encoding="encoding">content</text>
+"#;
+        let actual: AttachedText = read_element_from_string(input);
+        let expected = example_attached_text();
+        assert_eq!(actual, expected);
     }
 
     #[test]
-    fn no_supplied_encoding_should_pass_validation() {
-        let validation_result = AttachedText {
-            content_type: Some(NormalizedString("text/plain".to_string())),
+    fn it_should_read_xml_no_attributes() {
+        let input = r#"
+<text>content</text>
+"#;
+        let actual: AttachedText = read_element_from_string(input);
+        let expected = AttachedText {
+            content_type: None,
             encoding: None,
-            content: "not base64 encoded".to_string(),
-        }
-        .validate();
-
-        assert!(validation_result.passed());
+            content: "content".to_string(),
+        };
+        assert_eq!(actual, expected);
     }
 }

@@ -15,1009 +15,2198 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
-
-use std::collections::HashSet;
-use std::convert::TryInto;
-use std::fmt;
-use std::str::FromStr;
-
-use once_cell::sync::Lazy;
-use regex::Regex;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use xml::{EmitterConfig, EventReader, EventWriter, ParserConfig};
-
-use crate::errors::BomError;
-use crate::models::annotation::Annotations;
-use crate::models::component::{Component, Components};
-use crate::models::composition::Compositions;
-use crate::models::dependency::Dependencies;
-use crate::models::external_reference::ExternalReferences;
-use crate::models::formulation::Formula;
-use crate::models::metadata::Metadata;
-use crate::models::property::Properties;
-use crate::models::service::{Service, Services};
-use crate::models::signature::Signature;
-use crate::models::vulnerability::Vulnerabilities;
-use crate::validation::{Validate, ValidationContext, ValidationError, ValidationResult};
-use crate::xml::{FromXmlDocument, ToXml};
-
-use super::vulnerability::Vulnerability;
-
-/// Represents the spec version of a BOM.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy, PartialOrd, strum::Display)]
-pub enum SpecVersion {
-    #[strum(to_string = "1.3")]
-    #[serde(rename = "1.3")]
-    V1_3 = 1,
-    #[strum(to_string = "1.4")]
-    #[serde(rename = "1.4")]
-    V1_4 = 2,
-    #[strum(to_string = "1.5")]
-    #[serde(rename = "1.5")]
-    V1_5 = 3,
-}
-
-impl Default for SpecVersion {
-    fn default() -> Self {
-        Self::V1_3
-    }
-}
-
-impl FromStr for SpecVersion {
-    type Err = BomError;
-
-    fn from_str(input: &str) -> Result<Self, Self::Err> {
-        match input {
-            "1.3" => Ok(SpecVersion::V1_3),
-            "1.4" => Ok(SpecVersion::V1_4),
-            "1.5" => Ok(SpecVersion::V1_5),
-            s => Err(BomError::UnsupportedSpecVersion(s.to_string())),
-        }
-    }
-}
-
-pub fn validate_bom_ref(
-    _bom_ref: &BomReference,
-    version: SpecVersion,
-) -> Result<(), ValidationError> {
-    if version <= SpecVersion::V1_4 {
-        return Err("Attribute 'bom-ref' not supported in this format version".into());
-    }
-    Ok(())
-}
-
-/// A reference to a Bom element
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct BomReference(pub String);
-
-impl BomReference {
-    pub fn new<T>(input: T) -> Self
-    where
-        T: ToString,
-    {
-        Self(input.to_string())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Bom {
-    pub version: u32,
-    pub serial_number: Option<UrnUuid>,
-    pub metadata: Option<Metadata>,
-    pub components: Option<Components>,
-    pub services: Option<Services>,
-    pub external_references: Option<ExternalReferences>,
-    pub dependencies: Option<Dependencies>,
-    pub compositions: Option<Compositions>,
-    pub properties: Option<Properties>,
-    /// Added in version 1.4
-    pub vulnerabilities: Option<Vulnerabilities>,
-    /// Added in version 1.4
-    pub signature: Option<Signature>,
-    /// Added in version 1.5
-    pub annotations: Option<Annotations>,
-    /// Added in version 1.5
-    pub formulation: Option<Vec<Formula>>,
-    pub spec_version: SpecVersion,
-}
-
-impl Bom {
-    /// General function to parse a JSON file, fetches the `specVersion` field first then applies the right conversion.
-    pub fn parse_from_json<R: std::io::Read>(
-        mut reader: R,
-    ) -> Result<Self, crate::errors::JsonReadError> {
-        Self::parse_json_value(serde_json::from_reader(&mut reader)?)
-    }
-
-    /// General function to parse a pre-parsed JSON file, fetches the `specVersion` field first,
-    /// then applies the right conversion.
-    pub fn parse_json_value(json: Value) -> Result<Self, crate::errors::JsonReadError> {
-        if let Some(version) = json.get("specVersion") {
-            let version = version
-                .as_str()
-                .ok_or_else(|| BomError::UnsupportedSpecVersion(version.to_string()))?;
-
-            match SpecVersion::from_str(version)? {
-                SpecVersion::V1_3 => Ok(crate::specs::v1_3::bom::Bom::deserialize(json)?.into()),
-                SpecVersion::V1_4 => Ok(crate::specs::v1_4::bom::Bom::deserialize(json)?.into()),
-                SpecVersion::V1_5 => Ok(crate::specs::v1_5::bom::Bom::deserialize(json)?.into()),
-            }
-        } else {
-            Err(BomError::UnsupportedSpecVersion("No field 'specVersion' found".to_string()).into())
-        }
-    }
-
-    /// Parse the input as a JSON document conforming to the version of the specification that you provide.
-    /// Use [`parse_from_json`](Self::parse_from_json) if you want to support multiple versions instead.
-    pub fn parse_from_json_with_version<R: std::io::Read>(
-        reader: R,
-        version: SpecVersion,
-    ) -> Result<Self, crate::errors::JsonReadError> {
-        match version {
-            SpecVersion::V1_3 => Self::parse_from_json_v1_3(reader),
-            SpecVersion::V1_4 => Self::parse_from_json_v1_4(reader),
-            SpecVersion::V1_5 => Self::parse_from_json_v1_5(reader),
-        }
-    }
-
-    /// Output as a JSON document conforming to the specification version that you provide.
-    pub fn output_as_json<W: std::io::Write>(
-        self,
-        writer: &mut W,
-        version: SpecVersion,
-    ) -> Result<(), crate::errors::JsonWriteError> {
-        match version {
-            SpecVersion::V1_3 => self.output_as_json_v1_3(writer),
-            SpecVersion::V1_4 => self.output_as_json_v1_4(writer),
-            SpecVersion::V1_5 => self.output_as_json_v1_5(writer),
-        }
-    }
-
-    /// Parse the input as an XML document conforming to the version of the specification that you provide.
-    pub fn parse_from_xml_with_version<R: std::io::Read>(
-        reader: R,
-        version: SpecVersion,
-    ) -> Result<Self, crate::errors::XmlReadError> {
-        match version {
-            SpecVersion::V1_3 => Self::parse_from_xml_v1_3(reader),
-            SpecVersion::V1_4 => Self::parse_from_xml_v1_4(reader),
-            SpecVersion::V1_5 => Self::parse_from_xml_v1_5(reader),
-        }
-    }
-
-    /// Output as an XML document conforming to the specification version that you provide.
-    pub fn output_as_xml<W: std::io::Write>(
-        self,
-        writer: &mut W,
-        version: SpecVersion,
-    ) -> Result<(), crate::errors::XmlWriteError> {
-        match version {
-            SpecVersion::V1_3 => self.output_as_xml_v1_3(writer),
-            SpecVersion::V1_4 => self.output_as_xml_v1_4(writer),
-            SpecVersion::V1_5 => self.output_as_xml_v1_5(writer),
-        }
-    }
-
-    /// Parse the input as a JSON document conforming to [version 1.3 of the specification](https://cyclonedx.org/docs/1.3/json/)
-    pub fn parse_from_json_v1_3<R: std::io::Read>(
-        mut reader: R,
-    ) -> Result<Self, crate::errors::JsonReadError> {
-        let bom: crate::specs::v1_3::bom::Bom = serde_json::from_reader(&mut reader)?;
-        Ok(bom.into())
-    }
-
-    /// Parse the input as a JSON document conforming to [version 1.3 of the specification](https://cyclonedx.org/docs/1.3/json/)
-    /// from an existing [`Value`].
-    pub fn parse_from_json_value_v1_3(value: Value) -> Result<Self, crate::errors::JsonReadError> {
-        let bom: crate::specs::v1_3::bom::Bom = serde_json::from_value(value)?;
-        Ok(bom.into())
-    }
-
-    /// Parse the input as an XML document conforming to [version 1.3 of the specification](https://cyclonedx.org/docs/1.3/xml/)
-    pub fn parse_from_xml_v1_3<R: std::io::Read>(
-        reader: R,
-    ) -> Result<Self, crate::errors::XmlReadError> {
-        let config = ParserConfig::default().trim_whitespace(true);
-        let mut event_reader = EventReader::new_with_config(reader, config);
-        let bom = crate::specs::v1_3::bom::Bom::read_xml_document(&mut event_reader)?;
-        Ok(bom.into())
-    }
-
-    /// Output as a JSON document conforming to [version 1.3 of the specification](https://cyclonedx.org/docs/1.3/json/)
-    pub fn output_as_json_v1_3<W: std::io::Write>(
-        self,
-        writer: &mut W,
-    ) -> Result<(), crate::errors::JsonWriteError> {
-        let bom: crate::specs::v1_3::bom::Bom = self.try_into()?;
-        serde_json::to_writer_pretty(writer, &bom)?;
-        Ok(())
-    }
-
-    /// Output as an XML document conforming to [version 1.3 of the specification](https://cyclonedx.org/docs/1.3/xml/)
-    pub fn output_as_xml_v1_3<W: std::io::Write>(
-        self,
-        writer: &mut W,
-    ) -> Result<(), crate::errors::XmlWriteError> {
-        let config = EmitterConfig::default().perform_indent(true);
-        let mut event_writer = EventWriter::new_with_config(writer, config);
-
-        let bom: crate::specs::v1_3::bom::Bom = self.try_into()?;
-        bom.write_xml_element(&mut event_writer)
-    }
-
-    /// Parse the input as a JSON document conforming to [version 1.4 of the specification](https://cyclonedx.org/docs/1.4/json/)
-    pub fn parse_from_json_v1_4<R: std::io::Read>(
-        mut reader: R,
-    ) -> Result<Self, crate::errors::JsonReadError> {
-        let bom: crate::specs::v1_4::bom::Bom = serde_json::from_reader(&mut reader)?;
-        Ok(bom.into())
-    }
-
-    /// Parse the input as a JSON document conforming to [version 1.4 of the specification](https://cyclonedx.org/docs/1.4/json/)
-    /// from an existing [`Value`].
-    pub fn parse_from_json_value_v1_4(value: Value) -> Result<Self, crate::errors::JsonReadError> {
-        let bom: crate::specs::v1_4::bom::Bom = serde_json::from_value(value)?;
-        Ok(bom.into())
-    }
-
-    /// Parse the input as an XML document conforming to [version 1.4 of the specification](https://cyclonedx.org/docs/1.4/xml/)
-    pub fn parse_from_xml_v1_4<R: std::io::Read>(
-        reader: R,
-    ) -> Result<Self, crate::errors::XmlReadError> {
-        let config = ParserConfig::default().trim_whitespace(true);
-        let mut event_reader = EventReader::new_with_config(reader, config);
-        let bom = crate::specs::v1_4::bom::Bom::read_xml_document(&mut event_reader)?;
-        Ok(bom.into())
-    }
-
-    /// Output as a JSON document conforming to [version 1.4 of the specification](https://cyclonedx.org/docs/1.4/json/)
-    pub fn output_as_json_v1_4<W: std::io::Write>(
-        self,
-        writer: &mut W,
-    ) -> Result<(), crate::errors::JsonWriteError> {
-        let bom: crate::specs::v1_4::bom::Bom = self.try_into()?;
-        serde_json::to_writer_pretty(writer, &bom)?;
-        Ok(())
-    }
-
-    /// Output as an XML document conforming to [version 1.4 of the specification](https://cyclonedx.org/docs/1.4/xml/)
-    pub fn output_as_xml_v1_4<W: std::io::Write>(
-        self,
-        writer: &mut W,
-    ) -> Result<(), crate::errors::XmlWriteError> {
-        let config = EmitterConfig::default().perform_indent(true);
-        let mut event_writer = EventWriter::new_with_config(writer, config);
-
-        let bom: crate::specs::v1_4::bom::Bom = self.try_into()?;
-        bom.write_xml_element(&mut event_writer)
-    }
-
-    /// Parse the input as a JSON document conforming to [version 1.5 of the specification](https://cyclonedx.org/docs/1.5/json/)
-    pub fn parse_from_json_v1_5<R: std::io::Read>(
-        mut reader: R,
-    ) -> Result<Self, crate::errors::JsonReadError> {
-        let bom: crate::specs::v1_5::bom::Bom = serde_json::from_reader(&mut reader)?;
-        Ok(bom.into())
-    }
-
-    /// Parse the input as an XML document conforming to [version 1.5 of the specification](https://cyclonedx.org/docs/1.5/xml/)
-    pub fn parse_from_xml_v1_5<R: std::io::Read>(
-        reader: R,
-    ) -> Result<Self, crate::errors::XmlReadError> {
-        let config = ParserConfig::default().trim_whitespace(true);
-        let mut event_reader = EventReader::new_with_config(reader, config);
-        let bom = crate::specs::v1_5::bom::Bom::read_xml_document(&mut event_reader)?;
-        Ok(bom.into())
-    }
-
-    /// Output as a JSON document conforming to [version 1.5 of the specification](https://cyclonedx.org/docs/1.5/json/)
-    pub fn output_as_json_v1_5<W: std::io::Write>(
-        self,
-        writer: &mut W,
-    ) -> Result<(), crate::errors::JsonWriteError> {
-        let bom: crate::specs::v1_5::bom::Bom = self.try_into()?;
-        serde_json::to_writer_pretty(writer, &bom)?;
-        Ok(())
-    }
-
-    /// Output as an XML document conforming to [version 1.5 of the specification](https://cyclonedx.org/docs/1.5/xml/)
-    pub fn output_as_xml_v1_5<W: std::io::Write>(
-        self,
-        writer: &mut W,
-    ) -> Result<(), crate::errors::XmlWriteError> {
-        let config = EmitterConfig::default().perform_indent(true);
-        let mut event_writer = EventWriter::new_with_config(writer, config);
-
-        let bom: crate::specs::v1_5::bom::Bom = self.try_into()?;
-        bom.write_xml_element(&mut event_writer)
-    }
-}
-
-impl Default for Bom {
-    /// Construct a BOM with a default `version` of `1` and `serial_number` with a random UUID
-    fn default() -> Self {
-        Self {
-            version: 1,
-            serial_number: Some(UrnUuid::generate()),
-            metadata: None,
-            components: None,
-            services: None,
-            external_references: None,
-            dependencies: None,
-            compositions: None,
-            properties: None,
-            vulnerabilities: None,
-            signature: None,
-            annotations: None,
-            formulation: None,
-            spec_version: SpecVersion::V1_3,
-        }
-    }
-}
-
-impl Validate for Bom {
-    fn validate_version(&self, version: SpecVersion) -> ValidationResult {
-        let mut context = ValidationContext::new();
-        context.add_field_option(
-            "serial_number",
-            self.serial_number.as_ref(),
-            validate_urn_uuid,
-        );
-        context.add_struct_option("metadata", self.metadata.as_ref(), version);
-        context.add_struct_option("components", self.components.as_ref(), version);
-        context.add_struct_option("services", self.services.as_ref(), version);
-        context.add_struct_option(
-            "external_references",
-            self.external_references.as_ref(),
-            version,
-        );
-        context.add_struct_option("compositions", self.compositions.as_ref(), version);
-        context.add_struct_option("properties", self.properties.as_ref(), version);
-        context.add_struct_option("vulnerabilities", self.vulnerabilities.as_ref(), version);
-
-        // To keep track of all Bom references inside.
-        let mut bom_refs = BomReferencesContext::default();
-
-        if let Some(metadata) = &self.metadata {
-            if let Some(component) = &metadata.component {
-                validate_component_bom_refs(&mut context, &mut bom_refs, component);
-            }
-        }
-
-        if let Some(components) = &self.components {
-            validate_components(&mut context, &mut bom_refs, components);
-        }
-
-        if let Some(services) = &self.services {
-            validate_services(&mut context, &mut bom_refs, services);
-        }
-
-        if let Some(vulnerabilities) = &self.vulnerabilities {
-            validate_vulnerabilities(&mut context, &mut bom_refs, vulnerabilities);
-        }
-
-        // Check dependencies & sub dependencies
-        if let Some(dependencies) = &self.dependencies {
-            for dependency in &dependencies.0 {
-                if !bom_refs.contains(&dependency.dependency_ref) {
-                    context.add_custom(
-                        "dependency_ref",
-                        format!(
-                            "Dependency ref '{}' does not exist in the BOM",
-                            dependency.dependency_ref
-                        ),
-                    );
-                }
-
-                for sub_dependency in &dependency.dependencies {
-                    if !bom_refs.contains(sub_dependency) {
-                        context.add_custom(
-                            "sub dependency_ref",
-                            format!(
-                                "Dependency ref '{}' does not exist in the BOM",
-                                sub_dependency
-                            ),
-                        );
-                    }
-                }
-            }
-        }
-
-        // Check compositions, its dependencies & assemblies
-        if let Some(compositions) = &self.compositions {
-            for composition in &compositions.0 {
-                if let Some(assemblies) = &composition.assemblies {
-                    for BomReference(assembly) in assemblies {
-                        if !bom_refs.contains(assembly) {
-                            context.add_custom(
-                                "composition ref",
-                                format!(
-                                    "Composition reference '{assembly}' does not exist in the BOM"
-                                ),
-                            );
-                        }
-                    }
-                }
-
-                if let Some(dependencies) = &composition.dependencies {
-                    for BomReference(dependency) in dependencies {
-                        if !bom_refs.contains(dependency) {
-                            context.add_custom(
-                                "composition ref",
-                                format!(
-                                    "Composition reference '{dependency}' does not exist in the BOM"
-                                ),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        context.into()
-    }
-
-    fn validate(&self) -> ValidationResult {
-        self.validate_version(self.spec_version)
-    }
-}
-
-#[derive(Default)]
-struct BomReferencesContext {
-    component_bom_refs: HashSet<String>,
-    service_bom_refs: HashSet<String>,
-    vulnerabilities_bom_refs: HashSet<String>,
-}
-
-impl BomReferencesContext {
-    fn contains(&self, bom_ref: &String) -> bool {
-        self.component_bom_refs.contains(bom_ref)
-            || self.service_bom_refs.contains(bom_ref)
-            || self.vulnerabilities_bom_refs.contains(bom_ref)
-    }
-
-    fn add_component_bom_ref(&mut self, bom_ref: impl ToString) {
-        self.component_bom_refs.insert(bom_ref.to_string());
-    }
-
-    fn add_service_bom_ref(&mut self, bom_ref: impl ToString) {
-        self.service_bom_refs.insert(bom_ref.to_string());
-    }
-
-    fn add_vulnerability_bom_ref(&mut self, bom_ref: impl ToString) {
-        self.vulnerabilities_bom_refs.insert(bom_ref.to_string());
-    }
-}
-
-/// Validates the Bom references.
-fn validate_component_bom_refs(
-    context: &mut ValidationContext,
-    bom_refs: &mut BomReferencesContext,
-    component: &Component,
-) {
-    if let Some(bom_ref) = &component.bom_ref {
-        if bom_refs.contains(bom_ref) {
-            context.add_custom("bom_ref", format!(r#"Bom ref "{bom_ref}" is not unique"#));
-        }
-        bom_refs.add_component_bom_ref(bom_ref);
-    }
-
-    if let Some(components) = &component.components {
-        validate_components(context, bom_refs, components);
-    }
-}
-
-fn validate_components(
-    context: &mut ValidationContext,
-    bom_refs: &mut BomReferencesContext,
-    components: &Components,
-) {
-    for component in &components.0 {
-        validate_component_bom_refs(context, bom_refs, component);
-    }
-}
-
-fn validate_services(
-    context: &mut ValidationContext,
-    bom_refs: &mut BomReferencesContext,
-    services: &Services,
-) {
-    for service in &services.0 {
-        validate_service_bom_refs(context, bom_refs, service);
-    }
-}
-
-fn validate_service_bom_refs(
-    context: &mut ValidationContext,
-    bom_refs: &mut BomReferencesContext,
-    service: &Service,
-) {
-    if let Some(bom_ref) = &service.bom_ref {
-        if bom_refs.contains(bom_ref) {
-            context.add_custom("bom_ref", format!(r#"Bom ref "{bom_ref}" is not unique"#));
-        }
-        bom_refs.add_service_bom_ref(bom_ref);
-    }
-
-    if let Some(services) = &service.services {
-        validate_services(context, bom_refs, services);
-    }
-}
-
-fn validate_vulnerabilities(
-    context: &mut ValidationContext,
-    bom_refs: &mut BomReferencesContext,
-    vulnerabilities: &Vulnerabilities,
-) {
-    for vulnerability in &vulnerabilities.0 {
-        validate_vulnerabilities_bom_refs(context, bom_refs, vulnerability);
-    }
-}
-
-fn validate_vulnerabilities_bom_refs(
-    context: &mut ValidationContext,
-    bom_refs: &mut BomReferencesContext,
-    vulnerability: &Vulnerability,
-) {
-    if let Some(bom_ref) = &vulnerability.bom_ref {
-        if bom_refs.contains(bom_ref) {
-            context.add_custom("bom_ref", format!(r#"Bom ref "{bom_ref}" is not unique"#));
-        }
-        bom_refs.add_vulnerability_bom_ref(bom_ref);
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UrnUuid(pub String);
-
-impl UrnUuid {
-    pub fn new(value: String) -> Result<Self, UrnUuidError> {
-        match matches_urn_uuid_regex(&value) {
-            true => Ok(Self(value)),
-            false => Err(UrnUuidError::InvalidUrnUuid(
-                "UrnUuid does not match regular expression".to_string(),
-            )),
-        }
-    }
-
-    pub fn generate() -> Self {
-        Self::from(uuid::Uuid::new_v4())
-    }
-}
-
-impl fmt::Display for UrnUuid {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<uuid::Uuid> for UrnUuid {
-    fn from(uuid: uuid::Uuid) -> Self {
-        Self(format!("urn:uuid:{}", uuid))
-    }
-}
-
-/// Validates a given [`UrnUuid`].
-pub fn validate_urn_uuid(urn_uuid: &UrnUuid) -> Result<(), ValidationError> {
-    if !matches_urn_uuid_regex(&urn_uuid.0) {
-        return Err("UrnUuid does not match regular expression".into());
-    }
-    Ok(())
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum UrnUuidError {
-    InvalidUrnUuid(String),
-}
-
-fn matches_urn_uuid_regex(value: &str) -> bool {
-    static UUID_REGEX: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
-            .expect("Failed to compile regex.")
-    });
-    UUID_REGEX.is_match(value)
-}
-
-#[cfg(test)]
-mod test {
+use cyclonedx_bom_macros::versioned;
+
+#[versioned("1.3", "1.4", "1.5")]
+pub(crate) mod base {
+    #[versioned("1.3")]
+    use crate::specs::v1_3::{
+        component::Components, composition::Compositions, external_reference::ExternalReferences,
+        metadata::Metadata, service::Services,
+    };
+    #[versioned("1.4")]
+    use crate::specs::{
+        common::signature::Signature,
+        v1_4::{
+            component::Components, composition::Compositions,
+            external_reference::ExternalReferences, metadata::Metadata, service::Services,
+            vulnerability::Vulnerabilities,
+        },
+    };
     use crate::{
-        external_models::{
-            date_time::DateTime, normalized_string::NormalizedString, uri::Uri as Url,
+        errors::BomError,
+        models::{self, bom::SpecVersion},
+        utilities::{convert_optional, try_convert_optional},
+        xml::{
+            expected_namespace_or_error, optional_attribute, read_lax_validation_tag,
+            to_xml_read_error, to_xml_write_error, unexpected_element_error, FromXml,
+            FromXmlDocument, FromXmlType,
         },
-        models::{
-            component::{Classification, Component},
-            composition::{AggregateType, Composition},
-            dependency::Dependency,
-            external_reference::{ExternalReference, ExternalReferenceType, Uri},
-            property::Property,
-            service::Service,
-            vulnerability::Vulnerability,
+    };
+    #[versioned("1.5")]
+    use crate::{
+        specs::{
+            common::property::Properties,
+            common::signature::Signature,
+            v1_5::{
+                annotation::Annotations, component::Components, composition::Compositions,
+                external_reference::ExternalReferences, formulation::Formula, metadata::Metadata,
+                service::Services, vulnerability::Vulnerabilities,
+            },
         },
-        validation,
+        utilities::convert_optional_vec,
+        xml::write_list_tag,
     };
 
-    use super::*;
-    use pretty_assertions::assert_eq;
+    use crate::{specs::common::dependency::Dependencies, xml::ToXml};
+    use serde::{Deserialize, Serialize};
+    use xml::{reader, writer::XmlEvent};
 
-    #[test]
-    fn it_should_parse_json_using_function_without_suffix() {
-        let input = r#"{
-            "bomFormat": "CycloneDX",
-            "specVersion": "1.3",
-            "serialNumber": "urn:uuid:3e671687-395b-41f5-a30f-a58921a69b79",
-            "version": 1,
-            "components": []
-        }"#;
-        let result = Bom::parse_from_json(input.as_bytes());
-        assert!(result.is_ok());
+    #[versioned("1.3")]
+    const SPEC_VERSION: SpecVersion = SpecVersion::V1_3;
+    #[versioned("1.4")]
+    const SPEC_VERSION: SpecVersion = SpecVersion::V1_4;
+    #[versioned("1.5")]
+    const SPEC_VERSION: SpecVersion = SpecVersion::V1_5;
+
+    #[versioned("1.3")]
+    const NS: &str = "http://cyclonedx.org/schema/bom/1.3";
+    #[versioned("1.4")]
+    const NS: &str = "http://cyclonedx.org/schema/bom/1.4";
+    #[versioned("1.5")]
+    const NS: &str = "http://cyclonedx.org/schema/bom/1.5";
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq)]
+    #[serde(rename_all = "camelCase")]
+    pub(crate) struct Bom {
+        bom_format: BomFormat,
+        spec_version: SpecVersion,
+        version: u32,
+        serial_number: Option<UrnUuid>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metadata: Option<Metadata>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        components: Option<Components>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        services: Option<Services>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        external_references: Option<ExternalReferences>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dependencies: Option<Dependencies>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        compositions: Option<Compositions>,
+        #[versioned("1.4", "1.5")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        vulnerabilities: Option<Vulnerabilities>,
+        #[versioned("1.4", "1.5")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<Signature>,
+        #[versioned("1.5")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        annotations: Option<Annotations>,
+        #[versioned("1.5")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        properties: Option<Properties>,
+        #[versioned("1.5")]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        formulation: Option<Vec<Formula>>,
     }
 
-    #[test]
-    fn it_should_validate_an_empty_bom_as_passed() {
-        let bom = Bom {
-            version: 1,
-            spec_version: SpecVersion::V1_3,
-            serial_number: None,
-            metadata: None,
-            components: None,
-            services: None,
-            external_references: None,
-            dependencies: None,
-            compositions: None,
-            vulnerabilities: None,
-            signature: None,
-            annotations: None,
-            properties: None,
-            formulation: None,
-        };
+    impl TryFrom<models::bom::Bom> for Bom {
+        type Error = BomError;
 
-        let actual = bom.validate();
-
-        assert!(actual.passed());
-    }
-
-    #[test]
-    fn it_should_validate_broken_dependency_refs_as_failed() {
-        let bom = Bom {
-            version: 1,
-            spec_version: SpecVersion::V1_3,
-            serial_number: None,
-            metadata: None,
-            components: None,
-            services: None,
-            external_references: None,
-            dependencies: Some(Dependencies(vec![Dependency {
-                dependency_ref: "dependency".to_string(),
-                dependencies: vec!["sub-dependency".to_string()],
-            }])),
-            compositions: None,
-            properties: None,
-            vulnerabilities: None,
-            signature: None,
-            annotations: None,
-            formulation: None,
-        };
-
-        let actual = bom.validate();
-
-        assert_eq!(
-            actual,
-            vec![
-                validation::custom(
-                    "dependency_ref",
-                    ["Dependency ref 'dependency' does not exist in the BOM",],
-                ),
-                validation::custom(
-                    "sub dependency_ref",
-                    ["Dependency ref 'sub-dependency' does not exist in the BOM"]
-                )
-            ]
-            .into()
-        );
-    }
-
-    #[test]
-    fn it_should_validate_broken_composition_refs_as_failed() {
-        let bom = Bom {
-            version: 1,
-            spec_version: SpecVersion::V1_5,
-            serial_number: None,
-            metadata: None,
-            components: None,
-            services: None,
-            external_references: None,
-            dependencies: None,
-            compositions: Some(Compositions(vec![Composition {
-                bom_ref: None,
-                aggregate: AggregateType::Complete,
-                assemblies: Some(vec![BomReference("assembly".to_string())]),
-                dependencies: Some(vec![BomReference("dependencies".to_string())]),
-                vulnerabilities: None,
-                signature: None,
-            }])),
-            properties: None,
-            vulnerabilities: None,
-            signature: None,
-            annotations: None,
-            formulation: None,
-        };
-
-        let actual = bom.validate_version(SpecVersion::V1_3);
-
-        assert_eq!(
-            actual,
-            validation::custom(
-                "composition ref",
-                [
-                    "Composition reference 'assembly' does not exist in the BOM",
-                    "Composition reference 'dependencies' does not exist in the BOM"
-                ]
-            )
-        );
-    }
-
-    #[test]
-    fn it_should_validate_a_bom_with_multiple_validation_issues_as_failed() {
-        let bom = Bom {
-            version: 1,
-            spec_version: SpecVersion::V1_3,
-            serial_number: Some(UrnUuid("invalid uuid".to_string())),
-            metadata: Some(Metadata {
-                timestamp: Some(DateTime("invalid datetime".to_string())),
-                tools: None,
-                authors: None,
-                component: None,
-                manufacture: None,
-                supplier: None,
-                licenses: None,
-                properties: None,
-                lifecycles: None,
-            }),
-            components: Some(Components(vec![Component {
-                component_type: Classification::UnknownClassification("unknown".to_string()),
-                mime_type: None,
-                bom_ref: Some("dependency".to_string()),
-                supplier: None,
-                author: None,
-                publisher: None,
-                group: None,
-                name: NormalizedString::new("name"),
-                version: Some(NormalizedString::new("version")),
-                description: None,
-                scope: None,
-                hashes: None,
-                licenses: None,
-                copyright: None,
-                cpe: None,
-                purl: None,
-                swid: None,
-                modified: None,
-                pedigree: None,
-                external_references: None,
-                properties: None,
-                components: None,
-                evidence: None,
-                signature: None,
-                model_card: None,
-                data: None,
-            }])),
-            services: Some(Services(vec![Service::new("invalid\tname", None)])),
-            external_references: Some(ExternalReferences(vec![ExternalReference {
-                external_reference_type: ExternalReferenceType::UnknownExternalReferenceType(
-                    "unknown".to_string(),
-                ),
-                url: Uri::Url(Url("https://example.com".to_string())),
-                comment: None,
-                hashes: None,
-            }])),
-            dependencies: Some(Dependencies(vec![Dependency {
-                dependency_ref: "dependency".to_string(),
-                dependencies: vec![],
-            }])),
-            compositions: Some(Compositions(vec![Composition {
-                bom_ref: Some(BomReference::new("composition-1")),
-                aggregate: AggregateType::UnknownAggregateType("unknown".to_string()),
-                assemblies: None,
-                dependencies: None,
-                vulnerabilities: None,
-                signature: None,
-            }])),
-            properties: Some(Properties(vec![Property {
-                name: "name".to_string(),
-                value: NormalizedString("invalid\tvalue".to_string()),
-            }])),
-            vulnerabilities: Some(Vulnerabilities(vec![Vulnerability {
-                bom_ref: None,
-                id: None,
-                vulnerability_source: None,
-                vulnerability_references: None,
-                vulnerability_ratings: None,
-                cwes: None,
-                description: None,
-                detail: None,
-                recommendation: None,
-                workaround: None,
-                proof_of_concept: None,
-                advisories: None,
-                created: None,
-                published: None,
-                updated: None,
-                rejected: None,
-                vulnerability_credits: None,
-                tools: None,
-                vulnerability_analysis: None,
-                vulnerability_targets: None,
-                properties: None,
-            }])),
-            signature: None,
-            annotations: None,
-            formulation: None,
-        };
-
-        let actual = bom.validate();
-
-        assert_eq!(
-            actual,
-            vec![
-                validation::field("serial_number", "UrnUuid does not match regular expression"),
-                validation::r#struct(
-                    "metadata",
-                    validation::field(
-                        "timestamp",
-                        "DateTime does not conform to ISO 8601"
-                    )
-                ),
-                validation::r#struct(
-                    "components",
-                    validation::list(
-                        "inner",
-                        [(
-                            0,
-                            validation::field("component_type", "Unknown classification")
-                        )]
-                    )
-                ),
-                validation::r#struct(
-                    "services",
-                    validation::list(
-                        "inner",
-                        [(
-                            0,
-                            validation::field(
-                                "name",
-                                "NormalizedString contains invalid characters \\r \\n \\t or \\r\\n"
-                            )
-                        )]
-                    )
-                ),
-                validation::r#struct(
-                    "external_references",
-                    validation::list(
-                        "inner",
-                        [(
-                            0,
-                            validation::field("external_reference_type", "Unknown external reference type")
-                        )]
-                    )
-                ),
-                validation::r#struct(
-                    "compositions",
-                    validation::list(
-                        "composition",
-                        [(
-                            0,
-                            validation::field("aggregate", "Unknown aggregate type")
-                        )]
-                    )
-                ),
-                validation::r#struct(
-                    "properties",
-                    validation::list(
-                        "inner",
-                        [(
-                            0,
-                            validation::field(
-                                "value",
-                                "NormalizedString contains invalid characters \\r \\n \\t or \\r\\n"
-                            )
-                        )]
-                    )
-                )
-            ]
-            .into()
-        );
-    }
-
-    #[test]
-    fn it_should_validate_that_bom_references_are_unique() {
-        let component_builder = |bom_ref: &str| {
-            Component::new(
-                Classification::Library,
-                "lib-x",
-                "v0.1.0",
-                Some(bom_ref.to_string()),
-            )
-        };
-        let mut component_with_sub_components = component_builder("subcomponent-component");
-        component_with_sub_components.components = Some(Components(vec![component_builder(
-            "subcomponent-component",
-        )]));
-
-        let service_builder = |bom_ref: &str| Service::new("service-x", Some(bom_ref.to_string()));
-        let mut service_with_sub_services = service_builder("subservice-service");
-        service_with_sub_services.services =
-            Some(Services(vec![service_builder("subservice-service")]));
-
-        let validation_result = Bom {
-            version: 1,
-            spec_version: SpecVersion::V1_4,
-            serial_number: None,
-            metadata: Some(Metadata {
-                timestamp: None,
-                tools: None,
-                authors: None,
-                component: Some(component_builder("metadata-component")),
-                manufacture: None,
-                supplier: None,
-                licenses: None,
-                properties: None,
-                lifecycles: None,
-            }),
-            components: Some(Components(vec![
-                component_builder("metadata-component"),
-                component_builder("component-component"),
-                component_builder("component-component"),
-                component_with_sub_components,
-                component_builder("component-service"),
-            ])),
-            services: Some(Services(vec![
-                service_builder("service-service"),
-                service_builder("service-service"),
-                service_with_sub_services,
-                service_builder("component-service"),
-            ])),
-            external_references: None,
-            dependencies: None,
-            compositions: None,
-            properties: None,
-            vulnerabilities: None,
-            signature: None,
-            annotations: None,
-            formulation: None,
+        fn try_from(other: models::bom::Bom) -> Result<Self, Self::Error> {
+            Ok(Self {
+                bom_format: BomFormat::CycloneDX,
+                spec_version: SPEC_VERSION,
+                version: other.version,
+                serial_number: convert_optional(other.serial_number),
+                metadata: try_convert_optional(other.metadata)?,
+                components: try_convert_optional(other.components)?,
+                services: try_convert_optional(other.services)?,
+                external_references: try_convert_optional(other.external_references)?,
+                dependencies: convert_optional(other.dependencies),
+                compositions: convert_optional(other.compositions),
+                #[versioned("1.4", "1.5")]
+                vulnerabilities: try_convert_optional(other.vulnerabilities)?,
+                #[versioned("1.4", "1.5")]
+                signature: convert_optional(other.signature),
+                #[versioned("1.5")]
+                annotations: try_convert_optional(other.annotations)?,
+                #[versioned("1.5")]
+                properties: convert_optional(other.properties),
+                #[versioned("1.5")]
+                formulation: other
+                    .formulation
+                    .map(|formulation| {
+                        formulation
+                            .into_iter()
+                            .map(|formula| formula.try_into())
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?,
+            })
         }
-        .validate();
-
-        assert_eq!(
-            validation_result,
-            validation::custom(
-                "bom_ref",
-                [
-                    r#"Bom ref "metadata-component" is not unique"#,
-                    r#"Bom ref "component-component" is not unique"#,
-                    r#"Bom ref "subcomponent-component" is not unique"#,
-                    r#"Bom ref "service-service" is not unique"#,
-                    r#"Bom ref "subservice-service" is not unique"#,
-                    r#"Bom ref "component-service" is not unique"#,
-                ]
-            ),
-        );
     }
 
-    #[test]
-    fn valid_uuids_should_pass_validation() {
-        let validation_result = validate_urn_uuid(&UrnUuid::from(uuid::Uuid::new_v4()));
-
-        assert!(validation_result.is_ok());
+    impl From<Bom> for models::bom::Bom {
+        fn from(other: Bom) -> Self {
+            Self {
+                version: other.version,
+                serial_number: convert_optional(other.serial_number),
+                metadata: convert_optional(other.metadata),
+                components: convert_optional(other.components),
+                services: convert_optional(other.services),
+                external_references: convert_optional(other.external_references),
+                dependencies: convert_optional(other.dependencies),
+                compositions: convert_optional(other.compositions),
+                #[versioned("1.3")]
+                vulnerabilities: None,
+                #[versioned("1.4", "1.5")]
+                vulnerabilities: convert_optional(other.vulnerabilities),
+                #[versioned("1.3")]
+                signature: None,
+                #[versioned("1.4", "1.5")]
+                signature: convert_optional(other.signature),
+                #[versioned("1.3", "1.4")]
+                annotations: None,
+                #[versioned("1.5")]
+                annotations: convert_optional(other.annotations),
+                #[versioned("1.3", "1.4")]
+                properties: None,
+                #[versioned("1.5")]
+                properties: convert_optional(other.properties),
+                #[versioned("1.3", "1.4")]
+                formulation: None,
+                #[versioned("1.5")]
+                formulation: convert_optional_vec(other.formulation),
+                spec_version: other.spec_version,
+            }
+        }
     }
 
-    #[test]
-    fn invalid_uuids_should_fail_validation() {
-        let validation_result = validate_urn_uuid(&UrnUuid("invalid uuid".to_string()));
+    const BOM_TAG: &str = "bom";
+    const SERIAL_NUMBER_ATTR: &str = "serialNumber";
+    const VERSION_ATTR: &str = "version";
 
-        assert_eq!(
-            validation_result,
-            Err("UrnUuid does not match regular expression".into()),
-        );
+    impl ToXml for Bom {
+        fn write_xml_element<W: std::io::Write>(
+            &self,
+            writer: &mut xml::EventWriter<W>,
+        ) -> Result<(), crate::errors::XmlWriteError> {
+            let version = format!("{}", self.version);
+            let mut bom_start_element = XmlEvent::start_element(BOM_TAG).default_ns(NS);
+
+            if let Some(serial_number) = &self.serial_number {
+                bom_start_element = bom_start_element.attr(SERIAL_NUMBER_ATTR, &serial_number.0);
+            }
+
+            bom_start_element = bom_start_element.attr(VERSION_ATTR, version.as_str());
+
+            writer
+                .write(bom_start_element)
+                .map_err(to_xml_write_error(BOM_TAG))?;
+
+            if let Some(metadata) = &self.metadata {
+                metadata.write_xml_element(writer)?;
+            }
+
+            if let Some(components) = &self.components {
+                components.write_xml_element(writer)?;
+            }
+
+            if let Some(services) = &self.services {
+                services.write_xml_element(writer)?;
+            }
+
+            if let Some(external_references) = &self.external_references {
+                external_references.write_xml_element(writer)?;
+            }
+
+            if let Some(dependencies) = &self.dependencies {
+                dependencies.write_xml_element(writer)?;
+            }
+
+            if let Some(compositions) = &self.compositions {
+                compositions.write_xml_element(writer)?;
+            }
+
+            #[versioned("1.5")]
+            if let Some(properties) = &self.properties {
+                properties.write_xml_element(writer)?;
+            }
+
+            #[versioned("1.4", "1.5")]
+            if let Some(vulnerabilities) = &self.vulnerabilities {
+                vulnerabilities.write_xml_element(writer)?;
+            }
+
+            #[versioned("1.5")]
+            if let Some(formulation) = &self.formulation {
+                write_list_tag(writer, FORMULATION_TAG, formulation)?;
+            }
+
+            writer
+                .write(XmlEvent::end_element())
+                .map_err(to_xml_write_error(BOM_TAG))?;
+
+            Ok(())
+        }
+    }
+
+    const METADATA_TAG: &str = "metadata";
+    const COMPONENTS_TAG: &str = "components";
+    const SERVICES_TAG: &str = "services";
+    const EXTERNAL_REFERENCES_TAG: &str = "externalReferences";
+    const DEPENDENCIES_TAG: &str = "dependencies";
+    const COMPOSITIONS_TAG: &str = "compositions";
+    #[versioned("1.4", "1.5")]
+    const VULNERABILITIES_TAG: &str = "vulnerabilities";
+    #[versioned("1.4", "1.5")]
+    const SIGNATURE_TAG: &str = "signature";
+    #[versioned("1.5")]
+    const ANNOTATIONS_TAG: &str = "annotations";
+    #[versioned("1.5")]
+    const PROPERTIES_TAG: &str = "properties";
+    #[versioned("1.5")]
+    const FORMULATION_TAG: &str = "formulation";
+    #[versioned("1.5")]
+    const FORMULA_TAG: &str = "formula";
+
+    impl FromXmlDocument for Bom {
+        fn read_xml_document<R: std::io::Read>(
+            event_reader: &mut xml::EventReader<R>,
+        ) -> Result<Self, crate::errors::XmlReadError>
+        where
+            Self: Sized,
+        {
+            event_reader
+                .next()
+                .map_err(to_xml_read_error(BOM_TAG))
+                .and_then(|event| match event {
+                    reader::XmlEvent::StartDocument { .. } => Ok(()),
+                    unexpected => Err(unexpected_element_error(BOM_TAG, unexpected)),
+                })?;
+
+            let (version, serial_number) = event_reader
+                .next()
+                .map_err(to_xml_read_error(BOM_TAG))
+                .and_then(|event| match event {
+                    reader::XmlEvent::StartElement {
+                        name,
+                        attributes,
+                        namespace,
+                    } if name.local_name == BOM_TAG => {
+                        #[versioned("1.3")]
+                        expected_namespace_or_error("1.3", &namespace)?;
+                        #[versioned("1.4")]
+                        expected_namespace_or_error("1.4", &namespace)?;
+                        #[versioned("1.5")]
+                        expected_namespace_or_error("1.5", &namespace)?;
+                        let version =
+                            if let Some(version) = optional_attribute(&attributes, VERSION_ATTR) {
+                                u32::from_xml_value(VERSION_ATTR, version)?
+                            } else {
+                                1
+                            };
+                        let serial_number =
+                            optional_attribute(&attributes, SERIAL_NUMBER_ATTR).map(UrnUuid);
+                        Ok((version, serial_number))
+                    }
+                    unexpected => Err(unexpected_element_error(BOM_TAG, unexpected)),
+                })?;
+
+            let mut metadata: Option<Metadata> = None;
+            let mut components: Option<Components> = None;
+            let mut services: Option<Services> = None;
+            let mut external_references: Option<ExternalReferences> = None;
+            let mut dependencies: Option<Dependencies> = None;
+            let mut compositions: Option<Compositions> = None;
+            #[versioned("1.4", "1.5")]
+            let mut vulnerabilities: Option<Vulnerabilities> = None;
+            #[versioned("1.4", "1.5")]
+            let mut signature: Option<Signature> = None;
+            #[versioned("1.5")]
+            let mut annotations: Option<Annotations> = None;
+            #[versioned("1.5")]
+            let mut properties: Option<Properties> = None;
+            #[versioned("1.5")]
+            let mut formulation: Option<Vec<Formula>> = None;
+
+            let mut got_end_tag = false;
+            while !got_end_tag {
+                let next_element = event_reader.next().map_err(to_xml_read_error(BOM_TAG))?;
+                match next_element {
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == METADATA_TAG => {
+                        metadata = Some(Metadata::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?)
+                    }
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == COMPONENTS_TAG => {
+                        components = Some(Components::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?)
+                    }
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == SERVICES_TAG => {
+                        services = Some(Services::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?)
+                    }
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == EXTERNAL_REFERENCES_TAG => {
+                        external_references = Some(ExternalReferences::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?)
+                    }
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == DEPENDENCIES_TAG => {
+                        dependencies = Some(Dependencies::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?)
+                    }
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == COMPOSITIONS_TAG => {
+                        compositions = Some(Compositions::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?)
+                    }
+                    #[versioned("1.4", "1.5")]
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == VULNERABILITIES_TAG => {
+                        vulnerabilities = Some(Vulnerabilities::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?)
+                    }
+                    #[versioned("1.4", "1.5")]
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == SIGNATURE_TAG => {
+                        signature = Some(Signature::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?)
+                    }
+                    #[versioned("1.5")]
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == ANNOTATIONS_TAG => {
+                        annotations = Some(Annotations::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?)
+                    }
+                    #[versioned("1.5")]
+                    reader::XmlEvent::StartElement {
+                        name, attributes, ..
+                    } if name.local_name == PROPERTIES_TAG => {
+                        properties = Some(Properties::read_xml_element(
+                            event_reader,
+                            &name,
+                            &attributes,
+                        )?)
+                    }
+                    #[versioned("1.5")]
+                    reader::XmlEvent::StartElement { name, .. }
+                        if name.local_name == FORMULATION_TAG =>
+                    {
+                        formulation =
+                            Some(crate::xml::read_list_tag(event_reader, &name, FORMULA_TAG)?)
+                    }
+
+                    // lax validation of any elements from a different schema
+                    reader::XmlEvent::StartElement { name, .. } => {
+                        read_lax_validation_tag(event_reader, &name)?
+                    }
+                    reader::XmlEvent::EndElement { name } if name.local_name == BOM_TAG => {
+                        got_end_tag = true;
+                    }
+                    unexpected => return Err(unexpected_element_error(BOM_TAG, unexpected)),
+                }
+            }
+
+            event_reader
+                .next()
+                .map_err(to_xml_read_error(BOM_TAG))
+                .and_then(|event| match event {
+                    reader::XmlEvent::EndDocument => Ok(()),
+                    unexpected => Err(unexpected_element_error(BOM_TAG, unexpected)),
+                })?;
+
+            Ok(Self {
+                bom_format: BomFormat::CycloneDX,
+                spec_version: SPEC_VERSION,
+                version,
+                serial_number,
+                metadata,
+                components,
+                services,
+                external_references,
+                dependencies,
+                compositions,
+                #[versioned("1.4", "1.5")]
+                vulnerabilities,
+                #[versioned("1.4", "1.5")]
+                signature,
+                #[versioned("1.5")]
+                annotations,
+                #[versioned("1.5")]
+                properties,
+                #[versioned("1.5")]
+                formulation,
+            })
+        }
+    }
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq)]
+    enum BomFormat {
+        CycloneDX,
+    }
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq)]
+    struct UrnUuid(String);
+
+    impl From<models::bom::UrnUuid> for UrnUuid {
+        fn from(other: models::bom::UrnUuid) -> Self {
+            Self(other.0)
+        }
+    }
+
+    impl From<UrnUuid> for models::bom::UrnUuid {
+        fn from(other: UrnUuid) -> Self {
+            Self(other.0)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) mod test {
+        #[versioned("1.3")]
+        use crate::specs::v1_3::{
+            component::test::{corresponding_components, example_components},
+            composition::test::{corresponding_compositions, example_compositions},
+            external_reference::test::{
+                corresponding_external_references, example_external_references,
+            },
+            metadata::test::{corresponding_metadata, example_metadata},
+            service::test::{corresponding_services, example_services},
+        };
+        #[versioned("1.5")]
+        use crate::specs::{
+            common::property::test::{corresponding_properties, example_properties},
+            common::signature::test::{corresponding_signature, example_signature},
+            v1_5::{
+                annotation::test::{corresponding_annotations, example_annotations},
+                component::test::{corresponding_components, example_components},
+                composition::test::{corresponding_compositions, example_compositions},
+                external_reference::test::{
+                    corresponding_external_references, example_external_references,
+                },
+                formulation::test::{corresponding_formula, example_formula},
+                metadata::test::{corresponding_metadata, example_metadata},
+                service::test::{corresponding_services, example_services},
+                vulnerability::test::{corresponding_vulnerabilities, example_vulnerabilities},
+            },
+        };
+        #[versioned("1.4")]
+        use crate::specs::{
+            common::signature::test::{corresponding_signature, example_signature},
+            v1_4::{
+                component::test::{corresponding_components, example_components},
+                composition::test::{corresponding_compositions, example_compositions},
+                external_reference::test::{
+                    corresponding_external_references, example_external_references,
+                },
+                metadata::test::{corresponding_metadata, example_metadata},
+                service::test::{corresponding_services, example_services},
+                vulnerability::test::{corresponding_vulnerabilities, example_vulnerabilities},
+            },
+        };
+        use crate::{
+            specs::common::dependency::test::{corresponding_dependencies, example_dependencies},
+            xml::test::{read_document_from_string, write_element_to_string},
+        };
+
+        use super::*;
+        use pretty_assertions::assert_eq;
+
+        pub(crate) fn minimal_bom_example() -> Bom {
+            Bom {
+                bom_format: BomFormat::CycloneDX,
+                spec_version: SPEC_VERSION,
+                version: 1,
+                serial_number: Some(UrnUuid("fake-uuid".to_string())),
+                metadata: None,
+                components: None,
+                services: None,
+                external_references: None,
+                dependencies: None,
+                compositions: None,
+                #[versioned("1.4", "1.5")]
+                vulnerabilities: None,
+                #[versioned("1.4", "1.5")]
+                signature: None,
+                #[versioned("1.5")]
+                annotations: None,
+                #[versioned("1.5")]
+                properties: None,
+                #[versioned("1.5")]
+                formulation: None,
+            }
+        }
+
+        pub(crate) fn full_bom_example() -> Bom {
+            Bom {
+                bom_format: BomFormat::CycloneDX,
+                spec_version: SPEC_VERSION,
+                version: 1,
+                serial_number: Some(UrnUuid("fake-uuid".to_string())),
+                metadata: Some(example_metadata()),
+                components: Some(example_components()),
+                services: Some(example_services()),
+                external_references: Some(example_external_references()),
+                dependencies: Some(example_dependencies()),
+                compositions: Some(example_compositions()),
+                #[versioned("1.4", "1.5")]
+                vulnerabilities: Some(example_vulnerabilities()),
+                #[versioned("1.4", "1.5")]
+                signature: Some(example_signature()),
+                #[versioned("1.5")]
+                annotations: Some(example_annotations()),
+                #[versioned("1.5")]
+                properties: Some(example_properties()),
+                #[versioned("1.5")]
+                formulation: Some(vec![example_formula()]),
+            }
+        }
+
+        pub(crate) fn corresponding_internal_model() -> models::bom::Bom {
+            models::bom::Bom {
+                version: 1,
+                spec_version: SPEC_VERSION,
+                serial_number: Some(models::bom::UrnUuid("fake-uuid".to_string())),
+                metadata: Some(corresponding_metadata()),
+                components: Some(corresponding_components()),
+                services: Some(corresponding_services()),
+                external_references: Some(corresponding_external_references()),
+                dependencies: Some(corresponding_dependencies()),
+                compositions: Some(corresponding_compositions()),
+                #[versioned("1.3")]
+                vulnerabilities: None,
+                #[versioned("1.4", "1.5")]
+                vulnerabilities: Some(corresponding_vulnerabilities()),
+                #[versioned("1.3")]
+                signature: None,
+                #[versioned("1.4", "1.5")]
+                signature: Some(corresponding_signature()),
+                #[versioned("1.3", "1.4")]
+                annotations: None,
+                #[versioned("1.5")]
+                annotations: Some(corresponding_annotations()),
+                #[versioned("1.3", "1.4")]
+                properties: None,
+                #[versioned("1.5")]
+                properties: Some(corresponding_properties()),
+                #[versioned("1.3", "1.4")]
+                formulation: None,
+                #[versioned("1.5")]
+                formulation: Some(vec![corresponding_formula()]),
+            }
+        }
+
+        #[test]
+        fn it_should_serialize_to_json() {
+            insta::assert_json_snapshot!(minimal_bom_example());
+        }
+
+        #[test]
+        fn it_should_serialize_to_xml() {
+            let xml_output = write_element_to_string(minimal_bom_example());
+            insta::assert_snapshot!(xml_output);
+        }
+
+        #[test]
+        fn it_should_serialize_a_complex_example_to_json() {
+            let actual = full_bom_example();
+
+            insta::assert_json_snapshot!(actual);
+        }
+
+        #[test]
+        fn it_should_serialize_a_complex_example_to_xml() {
+            let xml_output = write_element_to_string(full_bom_example());
+            insta::assert_snapshot!(xml_output);
+        }
+
+        #[test]
+        fn it_can_convert_to_the_internal_model() {
+            let spec = full_bom_example();
+            let model: models::bom::Bom = spec.into();
+            assert_eq!(model, corresponding_internal_model());
+        }
+
+        #[test]
+        fn it_can_convert_from_the_internal_model() {
+            let model = corresponding_internal_model();
+            let spec: Bom = model.try_into().unwrap();
+            assert_eq!(spec, full_bom_example());
+        }
+
+        #[test]
+        fn it_should_deserialize_from_xml() {
+            let input = format!(
+                r#"
+<?xml version="1.0" encoding="utf-8"?>
+<bom xmlns="{NS}" serialNumber="fake-uuid" version="1" />
+"#
+            );
+            let actual: Bom = read_document_from_string(input.trim_start());
+            let expected = minimal_bom_example();
+            assert_eq!(actual, expected);
+        }
+
+        #[test]
+        fn it_should_deserialize_a_complex_example_from_xml() {
+            #[versioned("1.3")]
+            let input = r#"
+<?xml version="1.0" encoding="utf-8"?>
+<bom xmlns="http://cyclonedx.org/schema/bom/1.3" xmlns:example="https://example.com" serialNumber="fake-uuid" version="1">
+  <metadata>
+    <timestamp>timestamp</timestamp>
+    <tools>
+      <tool>
+        <vendor>vendor</vendor>
+        <name>name</name>
+        <version>version</version>
+        <hashes>
+          <hash alg="algorithm">hash value</hash>
+        </hashes>
+      </tool>
+    </tools>
+    <authors>
+      <author>
+        <name>name</name>
+        <email>email</email>
+        <phone>phone</phone>
+      </author>
+    </authors>
+    <component type="component type" mime-type="mime type" bom-ref="bom ref">
+      <supplier>
+        <name>name</name>
+        <url>url</url>
+        <contact>
+          <name>name</name>
+          <email>email</email>
+          <phone>phone</phone>
+        </contact>
+      </supplier>
+      <author>author</author>
+      <publisher>publisher</publisher>
+      <group>group</group>
+      <name>name</name>
+      <version>version</version>
+      <description>description</description>
+      <scope>scope</scope>
+      <hashes>
+        <hash alg="algorithm">hash value</hash>
+      </hashes>
+      <licenses>
+        <expression>expression</expression>
+      </licenses>
+      <copyright>copyright</copyright>
+      <cpe>cpe</cpe>
+      <purl>purl</purl>
+      <swid tagId="tag id" name="name" version="version" tagVersion="1" patch="true">
+        <text content-type="content type" encoding="encoding">content</text>
+        <url>url</url>
+      </swid>
+      <modified>true</modified>
+      <pedigree>
+        <ancestors />
+        <descendants />
+        <variants />
+        <commits>
+          <commit>
+            <uid>uid</uid>
+            <url>url</url>
+            <author>
+              <timestamp>timestamp</timestamp>
+              <name>name</name>
+              <email>email</email>
+            </author>
+            <committer>
+              <timestamp>timestamp</timestamp>
+              <name>name</name>
+              <email>email</email>
+            </committer>
+            <message>message</message>
+          </commit>
+        </commits>
+        <patches>
+          <patch type="patch type">
+            <diff>
+              <text content-type="content type" encoding="encoding">content</text>
+              <url>url</url>
+            </diff>
+            <resolves>
+              <issue type="issue type">
+                <id>id</id>
+                <name>name</name>
+                <description>description</description>
+                <source>
+                  <name>name</name>
+                  <url>url</url>
+                </source>
+                <references>
+                  <url>reference</url>
+                </references>
+              </issue>
+            </resolves>
+          </patch>
+        </patches>
+        <notes>notes</notes>
+      </pedigree>
+      <externalReferences>
+        <reference type="external reference type">
+          <url>url</url>
+          <comment>comment</comment>
+          <hashes>
+            <hash alg="algorithm">hash value</hash>
+          </hashes>
+        </reference>
+      </externalReferences>
+      <properties>
+        <property name="name">value</property>
+      </properties>
+      <components />
+      <evidence>
+        <licenses>
+          <expression>expression</expression>
+        </licenses>
+        <copyright>
+          <text><![CDATA[copyright]]></text>
+        </copyright>
+      </evidence>
+    </component>
+    <manufacture>
+      <name>name</name>
+      <url>url</url>
+      <contact>
+        <name>name</name>
+        <email>email</email>
+        <phone>phone</phone>
+      </contact>
+    </manufacture>
+    <supplier>
+      <name>name</name>
+      <url>url</url>
+      <contact>
+        <name>name</name>
+        <email>email</email>
+        <phone>phone</phone>
+      </contact>
+    </supplier>
+    <licenses>
+      <expression>expression</expression>
+    </licenses>
+    <properties>
+      <property name="name">value</property>
+    </properties>
+  </metadata>
+  <components>
+    <component type="component type" mime-type="mime type" bom-ref="bom ref">
+      <supplier>
+        <name>name</name>
+        <url>url</url>
+        <contact>
+          <name>name</name>
+          <email>email</email>
+          <phone>phone</phone>
+        </contact>
+      </supplier>
+      <author>author</author>
+      <publisher>publisher</publisher>
+      <group>group</group>
+      <name>name</name>
+      <version>version</version>
+      <description>description</description>
+      <scope>scope</scope>
+      <hashes>
+        <hash alg="algorithm">hash value</hash>
+      </hashes>
+      <licenses>
+        <expression>expression</expression>
+      </licenses>
+      <copyright>copyright</copyright>
+      <cpe>cpe</cpe>
+      <purl>purl</purl>
+      <swid tagId="tag id" name="name" version="version" tagVersion="1" patch="true">
+        <text content-type="content type" encoding="encoding">content</text>
+        <url>url</url>
+      </swid>
+      <modified>true</modified>
+      <pedigree>
+        <ancestors />
+        <descendants />
+        <variants />
+        <commits>
+          <commit>
+            <uid>uid</uid>
+            <url>url</url>
+            <author>
+              <timestamp>timestamp</timestamp>
+              <name>name</name>
+              <email>email</email>
+            </author>
+            <committer>
+              <timestamp>timestamp</timestamp>
+              <name>name</name>
+              <email>email</email>
+            </committer>
+            <message>message</message>
+          </commit>
+        </commits>
+        <patches>
+          <patch type="patch type">
+            <diff>
+              <text content-type="content type" encoding="encoding">content</text>
+              <url>url</url>
+            </diff>
+            <resolves>
+              <issue type="issue type">
+                <id>id</id>
+                <name>name</name>
+                <description>description</description>
+                <source>
+                  <name>name</name>
+                  <url>url</url>
+                </source>
+                <references>
+                  <url>reference</url>
+                </references>
+              </issue>
+            </resolves>
+          </patch>
+        </patches>
+        <notes>notes</notes>
+      </pedigree>
+      <externalReferences>
+        <reference type="external reference type">
+          <url>url</url>
+          <comment>comment</comment>
+          <hashes>
+            <hash alg="algorithm">hash value</hash>
+          </hashes>
+        </reference>
+      </externalReferences>
+      <properties>
+        <property name="name">value</property>
+      </properties>
+      <components />
+      <evidence>
+        <licenses>
+          <expression>expression</expression>
+        </licenses>
+        <copyright>
+          <text><![CDATA[copyright]]></text>
+        </copyright>
+      </evidence>
+    </component>
+  </components>
+  <services>
+    <service bom-ref="bom-ref">
+      <provider>
+        <name>name</name>
+        <url>url</url>
+        <contact>
+          <name>name</name>
+          <email>email</email>
+          <phone>phone</phone>
+        </contact>
+      </provider>
+      <group>group</group>
+      <name>name</name>
+      <version>version</version>
+      <description>description</description>
+      <endpoints>
+        <endpoint>endpoint</endpoint>
+      </endpoints>
+      <authenticated>true</authenticated>
+      <x-trust-boundary>true</x-trust-boundary>
+      <data>
+        <classification flow="flow">classification</classification>
+      </data>
+      <licenses>
+        <expression>expression</expression>
+      </licenses>
+      <externalReferences>
+        <reference type="external reference type">
+          <url>url</url>
+          <comment>comment</comment>
+          <hashes>
+            <hash alg="algorithm">hash value</hash>
+          </hashes>
+        </reference>
+      </externalReferences>
+      <properties>
+        <property name="name">value</property>
+      </properties>
+      <services />
+    </service>
+  </services>
+  <externalReferences>
+    <reference type="external reference type">
+      <url>url</url>
+      <comment>comment</comment>
+      <hashes>
+        <hash alg="algorithm">hash value</hash>
+      </hashes>
+    </reference>
+  </externalReferences>
+  <dependencies>
+    <dependency ref="ref">
+      <dependency ref="depends on" />
+    </dependency>
+  </dependencies>
+  <compositions>
+    <composition>
+      <aggregate>aggregate</aggregate>
+      <assemblies>
+        <assembly ref="assembly-ref" />
+      </assemblies>
+      <dependencies>
+        <dependency ref="dependency-ref" />
+      </dependencies>
+    </composition>
+  </compositions>
+  <properties>
+    <property name="name">value</property>
+  </properties>
+  <example:laxValidation>
+    <example:innerElement id="test" />
+  </example:laxValidation>
+</bom>
+"#.trim_start();
+            #[versioned("1.4")]
+            let input = r#"
+<?xml version="1.0" encoding="utf-8"?>
+<bom xmlns="http://cyclonedx.org/schema/bom/1.4" xmlns:example="https://example.com" serialNumber="fake-uuid" version="1">
+  <metadata>
+    <timestamp>timestamp</timestamp>
+    <tools>
+      <tool>
+        <vendor>vendor</vendor>
+        <name>name</name>
+        <version>version</version>
+        <hashes>
+          <hash alg="algorithm">hash value</hash>
+        </hashes>
+        <externalReferences>
+          <reference type="external reference type">
+            <url>url</url>
+            <comment>comment</comment>
+            <hashes>
+              <hash alg="algorithm">hash value</hash>
+            </hashes>
+          </reference>
+        </externalReferences>
+      </tool>
+    </tools>
+    <authors>
+      <author>
+        <name>name</name>
+        <email>email</email>
+        <phone>phone</phone>
+      </author>
+    </authors>
+    <component type="component type" mime-type="mime type" bom-ref="bom ref">
+      <supplier>
+        <name>name</name>
+        <url>url</url>
+        <contact>
+          <name>name</name>
+          <email>email</email>
+          <phone>phone</phone>
+        </contact>
+      </supplier>
+      <author>author</author>
+      <publisher>publisher</publisher>
+      <group>group</group>
+      <name>name</name>
+      <version>version</version>
+      <description>description</description>
+      <scope>scope</scope>
+      <hashes>
+        <hash alg="algorithm">hash value</hash>
+      </hashes>
+      <licenses>
+        <expression>expression</expression>
+      </licenses>
+      <copyright>copyright</copyright>
+      <cpe>cpe</cpe>
+      <purl>purl</purl>
+      <swid tagId="tag id" name="name" version="version" tagVersion="1" patch="true">
+        <text content-type="content type" encoding="encoding">content</text>
+        <url>url</url>
+      </swid>
+      <modified>true</modified>
+      <pedigree>
+        <ancestors />
+        <descendants />
+        <variants />
+        <commits>
+          <commit>
+            <uid>uid</uid>
+            <url>url</url>
+            <author>
+              <timestamp>timestamp</timestamp>
+              <name>name</name>
+              <email>email</email>
+            </author>
+            <committer>
+              <timestamp>timestamp</timestamp>
+              <name>name</name>
+              <email>email</email>
+            </committer>
+            <message>message</message>
+          </commit>
+        </commits>
+        <patches>
+          <patch type="patch type">
+            <diff>
+              <text content-type="content type" encoding="encoding">content</text>
+              <url>url</url>
+            </diff>
+            <resolves>
+              <issue type="issue type">
+                <id>id</id>
+                <name>name</name>
+                <description>description</description>
+                <source>
+                  <name>name</name>
+                  <url>url</url>
+                </source>
+                <references>
+                  <url>reference</url>
+                </references>
+              </issue>
+            </resolves>
+          </patch>
+        </patches>
+        <notes>notes</notes>
+      </pedigree>
+      <externalReferences>
+        <reference type="external reference type">
+          <url>url</url>
+          <comment>comment</comment>
+          <hashes>
+            <hash alg="algorithm">hash value</hash>
+          </hashes>
+        </reference>
+      </externalReferences>
+      <properties>
+        <property name="name">value</property>
+      </properties>
+      <components />
+      <evidence>
+        <licenses>
+          <expression>expression</expression>
+        </licenses>
+        <copyright>
+          <text><![CDATA[copyright]]></text>
+        </copyright>
+      </evidence>
+      <signature>
+        <algorithm>HS512</algorithm>
+        <value>1234567890</value>
+      </signature>
+    </component>
+    <manufacture>
+      <name>name</name>
+      <url>url</url>
+      <contact>
+        <name>name</name>
+        <email>email</email>
+        <phone>phone</phone>
+      </contact>
+    </manufacture>
+    <supplier>
+      <name>name</name>
+      <url>url</url>
+      <contact>
+        <name>name</name>
+        <email>email</email>
+        <phone>phone</phone>
+      </contact>
+    </supplier>
+    <licenses>
+      <expression>expression</expression>
+    </licenses>
+    <properties>
+      <property name="name">value</property>
+    </properties>
+  </metadata>
+  <components>
+    <component type="component type" mime-type="mime type" bom-ref="bom ref">
+      <supplier>
+        <name>name</name>
+        <url>url</url>
+        <contact>
+          <name>name</name>
+          <email>email</email>
+          <phone>phone</phone>
+        </contact>
+      </supplier>
+      <author>author</author>
+      <publisher>publisher</publisher>
+      <group>group</group>
+      <name>name</name>
+      <version>version</version>
+      <description>description</description>
+      <scope>scope</scope>
+      <hashes>
+        <hash alg="algorithm">hash value</hash>
+      </hashes>
+      <licenses>
+        <expression>expression</expression>
+      </licenses>
+      <copyright>copyright</copyright>
+      <cpe>cpe</cpe>
+      <purl>purl</purl>
+      <swid tagId="tag id" name="name" version="version" tagVersion="1" patch="true">
+        <text content-type="content type" encoding="encoding">content</text>
+        <url>url</url>
+      </swid>
+      <modified>true</modified>
+      <pedigree>
+        <ancestors />
+        <descendants />
+        <variants />
+        <commits>
+          <commit>
+            <uid>uid</uid>
+            <url>url</url>
+            <author>
+              <timestamp>timestamp</timestamp>
+              <name>name</name>
+              <email>email</email>
+            </author>
+            <committer>
+              <timestamp>timestamp</timestamp>
+              <name>name</name>
+              <email>email</email>
+            </committer>
+            <message>message</message>
+          </commit>
+        </commits>
+        <patches>
+          <patch type="patch type">
+            <diff>
+              <text content-type="content type" encoding="encoding">content</text>
+              <url>url</url>
+            </diff>
+            <resolves>
+              <issue type="issue type">
+                <id>id</id>
+                <name>name</name>
+                <description>description</description>
+                <source>
+                  <name>name</name>
+                  <url>url</url>
+                </source>
+                <references>
+                  <url>reference</url>
+                </references>
+              </issue>
+            </resolves>
+          </patch>
+        </patches>
+        <notes>notes</notes>
+      </pedigree>
+      <externalReferences>
+        <reference type="external reference type">
+          <url>url</url>
+          <comment>comment</comment>
+          <hashes>
+            <hash alg="algorithm">hash value</hash>
+          </hashes>
+        </reference>
+      </externalReferences>
+      <properties>
+        <property name="name">value</property>
+      </properties>
+      <components />
+      <evidence>
+        <licenses>
+          <expression>expression</expression>
+        </licenses>
+        <copyright>
+          <text><![CDATA[copyright]]></text>
+        </copyright>
+      </evidence>
+      <signature>
+        <algorithm>HS512</algorithm>
+        <value>1234567890</value>
+      </signature>
+    </component>
+  </components>
+  <services>
+    <service bom-ref="bom-ref">
+      <provider>
+        <name>name</name>
+        <url>url</url>
+        <contact>
+          <name>name</name>
+          <email>email</email>
+          <phone>phone</phone>
+        </contact>
+      </provider>
+      <group>group</group>
+      <name>name</name>
+      <version>version</version>
+      <description>description</description>
+      <endpoints>
+        <endpoint>endpoint</endpoint>
+      </endpoints>
+      <authenticated>true</authenticated>
+      <x-trust-boundary>true</x-trust-boundary>
+      <data>
+        <classification flow="flow">classification</classification>
+      </data>
+      <licenses>
+        <expression>expression</expression>
+      </licenses>
+      <externalReferences>
+        <reference type="external reference type">
+          <url>url</url>
+          <comment>comment</comment>
+          <hashes>
+            <hash alg="algorithm">hash value</hash>
+          </hashes>
+        </reference>
+      </externalReferences>
+      <properties>
+        <property name="name">value</property>
+      </properties>
+      <services />
+      <signature>
+        <algorithm>HS512</algorithm>
+        <value>1234567890</value>
+      </signature>
+    </service>
+  </services>
+  <externalReferences>
+    <reference type="external reference type">
+      <url>url</url>
+      <comment>comment</comment>
+      <hashes>
+        <hash alg="algorithm">hash value</hash>
+      </hashes>
+    </reference>
+  </externalReferences>
+  <dependencies>
+    <dependency ref="ref">
+      <dependency ref="depends on" />
+    </dependency>
+  </dependencies>
+  <compositions>
+    <composition>
+      <aggregate>aggregate</aggregate>
+      <assemblies>
+        <assembly ref="assembly-ref" />
+      </assemblies>
+      <dependencies>
+        <dependency ref="dependency-ref" />
+      </dependencies>
+      <signature>
+        <algorithm>HS512</algorithm>
+        <value>1234567890</value>
+      </signature>
+    </composition>
+  </compositions>
+  <properties>
+    <property name="name">value</property>
+  </properties>
+  <vulnerabilities>
+    <vulnerability bom-ref="bom-ref">
+      <id>id</id>
+      <source>
+        <name>name</name>
+        <url>url</url>
+      </source>
+      <references>
+        <reference>
+          <id>id</id>
+          <source>
+            <name>name</name>
+            <url>url</url>
+          </source>
+        </reference>
+      </references>
+      <ratings>
+        <rating>
+          <source>
+            <name>name</name>
+            <url>url</url>
+          </source>
+          <score>9.8</score>
+          <severity>info</severity>
+          <method>CVSSv3</method>
+          <vector>vector</vector>
+          <justification>justification</justification>
+        </rating>
+      </ratings>
+      <cwes>
+        <cwe>1</cwe>
+        <cwe>2</cwe>
+        <cwe>3</cwe>
+      </cwes>
+      <description>description</description>
+      <detail>detail</detail>
+      <recommendation>recommendation</recommendation>
+      <advisories>
+        <advisory>
+          <title>title</title>
+          <url>url</url>
+        </advisory>
+      </advisories>
+      <created>created</created>
+      <published>published</published>
+      <updated>updated</updated>
+      <credits>
+        <organizations>
+          <organization>
+            <name>name</name>
+            <url>url</url>
+            <contact>
+              <name>name</name>
+              <email>email</email>
+              <phone>phone</phone>
+            </contact>
+          </organization>
+        </organizations>
+        <individuals>
+          <individual>
+            <name>name</name>
+            <email>email</email>
+            <phone>phone</phone>
+          </individual>
+        </individuals>
+      </credits>
+      <tools>
+        <tool>
+          <vendor>vendor</vendor>
+          <name>name</name>
+          <version>version</version>
+          <hashes>
+            <hash alg="algorithm">hash value</hash>
+          </hashes>
+          <externalReferences>
+            <reference type="external reference type">
+              <url>url</url>
+              <comment>comment</comment>
+              <hashes>
+                <hash alg="algorithm">hash value</hash>
+              </hashes>
+            </reference>
+          </externalReferences>
+        </tool>
+      </tools>
+      <analysis>
+        <state>not_affected</state>
+        <justification>code_not_reachable</justification>
+        <responses>
+          <response>update</response>
+        </responses>
+        <detail>detail</detail>
+      </analysis>
+      <affects>
+        <target>
+          <ref>ref</ref>
+          <versions>
+            <version>
+              <version>5.0.0</version>
+              <status>unaffected</status>
+            </version>
+            <version>
+              <range>vers:npm/1.2.3|>=2.0.0|&lt;5.0.0</range>
+              <status>affected</status>
+            </version>
+          </versions>
+        </target>
+      </affects>
+      <properties>
+        <property name="name">value</property>
+      </properties>
+    </vulnerability>
+  </vulnerabilities>
+  <signature>
+    <algorithm>HS512</algorithm>
+    <value>1234567890</value>
+  </signature>
+  <example:laxValidation>
+    <example:innerElement id="test" />
+  </example:laxValidation>
+</bom>
+"#.trim_start();
+            #[versioned("1.5")]
+            let input = r#"
+<?xml version="1.0" encoding="utf-8"?>
+<bom xmlns="http://cyclonedx.org/schema/bom/1.5" xmlns:example="https://example.com" serialNumber="fake-uuid" version="1">
+  <metadata>
+    <timestamp>timestamp</timestamp>
+    <tools>
+      <tool>
+        <vendor>vendor</vendor>
+        <name>name</name>
+        <version>version</version>
+        <hashes>
+          <hash alg="algorithm">hash value</hash>
+        </hashes>
+        <externalReferences>
+          <reference type="external reference type">
+            <url>url</url>
+            <comment>comment</comment>
+            <hashes>
+              <hash alg="algorithm">hash value</hash>
+            </hashes>
+          </reference>
+        </externalReferences>
+      </tool>
+    </tools>
+    <authors>
+      <author>
+        <name>name</name>
+        <email>email</email>
+        <phone>phone</phone>
+      </author>
+    </authors>
+    <component type="component type" mime-type="mime type" bom-ref="bom ref">
+      <supplier>
+        <name>name</name>
+        <url>url</url>
+        <contact>
+          <name>name</name>
+          <email>email</email>
+          <phone>phone</phone>
+        </contact>
+      </supplier>
+      <author>author</author>
+      <publisher>publisher</publisher>
+      <group>group</group>
+      <name>name</name>
+      <version>version</version>
+      <description>description</description>
+      <scope>scope</scope>
+      <hashes>
+        <hash alg="algorithm">hash value</hash>
+      </hashes>
+      <licenses>
+        <expression>expression</expression>
+      </licenses>
+      <copyright>copyright</copyright>
+      <cpe>cpe</cpe>
+      <purl>purl</purl>
+      <swid tagId="tag id" name="name" version="version" tagVersion="1" patch="true">
+        <text content-type="content type" encoding="encoding">content</text>
+        <url>url</url>
+      </swid>
+      <modified>true</modified>
+      <pedigree>
+        <ancestors />
+        <descendants />
+        <variants />
+        <commits>
+          <commit>
+            <uid>uid</uid>
+            <url>url</url>
+            <author>
+              <timestamp>timestamp</timestamp>
+              <name>name</name>
+              <email>email</email>
+            </author>
+            <committer>
+              <timestamp>timestamp</timestamp>
+              <name>name</name>
+              <email>email</email>
+            </committer>
+            <message>message</message>
+          </commit>
+        </commits>
+        <patches>
+          <patch type="patch type">
+            <diff>
+              <text content-type="content type" encoding="encoding">content</text>
+              <url>url</url>
+            </diff>
+            <resolves>
+              <issue type="issue type">
+                <id>id</id>
+                <name>name</name>
+                <description>description</description>
+                <source>
+                  <name>name</name>
+                  <url>url</url>
+                </source>
+                <references>
+                  <url>reference</url>
+                </references>
+              </issue>
+            </resolves>
+          </patch>
+        </patches>
+        <notes>notes</notes>
+      </pedigree>
+      <externalReferences>
+        <reference type="external reference type">
+          <url>url</url>
+          <comment>comment</comment>
+          <hashes>
+            <hash alg="algorithm">hash value</hash>
+          </hashes>
+        </reference>
+      </externalReferences>
+      <properties>
+        <property name="name">value</property>
+      </properties>
+      <components />
+      <evidence>
+        <licenses>
+          <expression>expression</expression>
+        </licenses>
+        <copyright>
+          <text><![CDATA[copyright]]></text>
+        </copyright>
+        <occurrences>
+          <occurrence bom-ref="occurrence-1">
+            <location>location-1</location>
+          </occurrence>
+        </occurrences>
+        <callstack>
+          <frame>
+            <frame>
+              <package>package-1</package>
+              <module>module-1</module>
+              <function>function</function>
+              <line>10</line>
+              <column>20</column>
+              <fullFilename>full-filename</fullFilename>
+            </frame>
+          </frame>
+        </callstack>
+        <identity>
+          <field>group</field>
+          <confidence>0.5</confidence>
+          <methods>
+            <method>
+              <technique>technique-1</technique>
+              <confidence>0.8</confidence>
+              <value>identity-value</value>
+            </method>
+          </methods>
+          <tools>
+            <tool ref="tool-ref-1" />
+          </tools>
+        </identity>
+      </evidence>
+      <signature>
+        <algorithm>HS512</algorithm>
+        <value>1234567890</value>
+      </signature>
+      <modelCard bom-ref="modelcard-1">
+        <modelParameters>
+          <approach>
+            <type>supervised</type>
+          </approach>
+          <task>Task</task>
+          <architectureFamily>Architecture</architectureFamily>
+          <modelArchitecture>Model</modelArchitecture>
+          <datasets>
+            <dataset bom-ref="dataset-1">
+              <type>dataset</type>
+              <name>Training Data</name>
+              <contents>
+                <url>https://example.com/path/to/dataset</url>
+              </contents>
+              <classification>public</classification>
+              <governance>
+                <owners>
+                  <owner>
+                    <contact bom-ref="contact-1">
+                      <name>Contact</name>
+                      <email>contact@example.com</email>
+                    </contact>
+                  </owner>
+                </owners>
+              </governance>
+            </dataset>
+          </datasets>
+          <inputs>
+            <input>
+              <format>string</format>
+            </input>
+          </inputs>
+          <outputs>
+            <output>
+              <format>image</format>
+            </output>
+          </outputs>
+        </modelParameters>
+        <quantitativeAnalysis>
+          <performanceMetrics>
+            <performanceMetric>
+              <type>metric-1</type>
+              <value>metric value</value>
+              <confidenceInterval>
+                <lowerBound>low</lowerBound>
+                <upperBound>high</upperBound>
+              </confidenceInterval>
+            </performanceMetric>
+          </performanceMetrics>
+          <graphics>
+            <description>Graphic Desc</description>
+            <collection>
+              <graphic>
+                <name>Graphic A</name>
+                <image>1234</image>
+              </graphic>
+            </collection>
+          </graphics>
+        </quantitativeAnalysis>
+      </modelCard>
+      <data>
+        <type>configuration</type>
+        <name>config</name>
+        <contents>
+          <attachment>foo: bar</attachment>
+        </contents>
+      </data>
+    </component>
+    <manufacture>
+      <name>name</name>
+      <url>url</url>
+      <contact>
+        <name>name</name>
+        <email>email</email>
+        <phone>phone</phone>
+      </contact>
+    </manufacture>
+    <supplier>
+      <name>name</name>
+      <url>url</url>
+      <contact>
+        <name>name</name>
+        <email>email</email>
+        <phone>phone</phone>
+      </contact>
+    </supplier>
+    <licenses>
+      <expression>expression</expression>
+    </licenses>
+    <properties>
+      <property name="name">value</property>
+    </properties>
+    <lifecycles>
+      <lifecycle>
+        <phase>design</phase>
+      </lifecycle>
+    </lifecycles>
+  </metadata>
+  <components>
+    <component type="component type" mime-type="mime type" bom-ref="bom ref">
+      <supplier>
+        <name>name</name>
+        <url>url</url>
+        <contact>
+          <name>name</name>
+          <email>email</email>
+          <phone>phone</phone>
+        </contact>
+      </supplier>
+      <author>author</author>
+      <publisher>publisher</publisher>
+      <group>group</group>
+      <name>name</name>
+      <version>version</version>
+      <description>description</description>
+      <scope>scope</scope>
+      <hashes>
+        <hash alg="algorithm">hash value</hash>
+      </hashes>
+      <licenses>
+        <expression>expression</expression>
+      </licenses>
+      <copyright>copyright</copyright>
+      <cpe>cpe</cpe>
+      <purl>purl</purl>
+      <swid tagId="tag id" name="name" version="version" tagVersion="1" patch="true">
+        <text content-type="content type" encoding="encoding">content</text>
+        <url>url</url>
+      </swid>
+      <modified>true</modified>
+      <pedigree>
+        <ancestors />
+        <descendants />
+        <variants />
+        <commits>
+          <commit>
+            <uid>uid</uid>
+            <url>url</url>
+            <author>
+              <timestamp>timestamp</timestamp>
+              <name>name</name>
+              <email>email</email>
+            </author>
+            <committer>
+              <timestamp>timestamp</timestamp>
+              <name>name</name>
+              <email>email</email>
+            </committer>
+            <message>message</message>
+          </commit>
+        </commits>
+        <patches>
+          <patch type="patch type">
+            <diff>
+              <text content-type="content type" encoding="encoding">content</text>
+              <url>url</url>
+            </diff>
+            <resolves>
+              <issue type="issue type">
+                <id>id</id>
+                <name>name</name>
+                <description>description</description>
+                <source>
+                  <name>name</name>
+                  <url>url</url>
+                </source>
+                <references>
+                  <url>reference</url>
+                </references>
+              </issue>
+            </resolves>
+          </patch>
+        </patches>
+        <notes>notes</notes>
+      </pedigree>
+      <externalReferences>
+        <reference type="external reference type">
+          <url>url</url>
+          <comment>comment</comment>
+          <hashes>
+            <hash alg="algorithm">hash value</hash>
+          </hashes>
+        </reference>
+      </externalReferences>
+      <properties>
+        <property name="name">value</property>
+      </properties>
+      <components />
+      <evidence>
+        <licenses>
+          <expression>expression</expression>
+        </licenses>
+        <copyright>
+          <text><![CDATA[copyright]]></text>
+        </copyright>
+        <occurrences>
+          <occurrence bom-ref="occurrence-1">
+            <location>location-1</location>
+          </occurrence>
+        </occurrences>
+        <callstack>
+          <frame>
+            <frame>
+              <package>package-1</package>
+              <module>module-1</module>
+              <function>function</function>
+              <line>10</line>
+              <column>20</column>
+              <fullFilename>full-filename</fullFilename>
+            </frame>
+          </frame>
+        </callstack>
+        <identity>
+          <field>group</field>
+          <confidence>0.5</confidence>
+          <methods>
+            <method>
+              <technique>technique-1</technique>
+              <confidence>0.8</confidence>
+              <value>identity-value</value>
+            </method>
+          </methods>
+          <tools>
+            <tool ref="tool-ref-1" />
+          </tools>
+        </identity>
+      </evidence>
+      <signature>
+        <algorithm>HS512</algorithm>
+        <value>1234567890</value>
+      </signature>
+      <modelCard bom-ref="modelcard-1">
+        <modelParameters>
+          <approach>
+            <type>supervised</type>
+          </approach>
+          <task>Task</task>
+          <architectureFamily>Architecture</architectureFamily>
+          <modelArchitecture>Model</modelArchitecture>
+          <datasets>
+            <dataset bom-ref="dataset-1">
+              <type>dataset</type>
+              <name>Training Data</name>
+              <contents>
+                <url>https://example.com/path/to/dataset</url>
+              </contents>
+              <classification>public</classification>
+              <governance>
+                <owners>
+                  <owner>
+                    <contact bom-ref="contact-1">
+                      <name>Contact</name>
+                      <email>contact@example.com</email>
+                    </contact>
+                  </owner>
+                </owners>
+              </governance>
+            </dataset>
+          </datasets>
+          <inputs>
+            <input>
+              <format>string</format>
+            </input>
+          </inputs>
+          <outputs>
+            <output>
+              <format>image</format>
+            </output>
+          </outputs>
+        </modelParameters>
+        <quantitativeAnalysis>
+          <performanceMetrics>
+            <performanceMetric>
+              <type>metric-1</type>
+              <value>metric value</value>
+              <confidenceInterval>
+                <lowerBound>low</lowerBound>
+                <upperBound>high</upperBound>
+              </confidenceInterval>
+            </performanceMetric>
+          </performanceMetrics>
+          <graphics>
+            <description>Graphic Desc</description>
+            <collection>
+              <graphic>
+                <name>Graphic A</name>
+                <image>1234</image>
+              </graphic>
+            </collection>
+          </graphics>
+        </quantitativeAnalysis>
+      </modelCard>
+      <data>
+        <type>configuration</type>
+        <name>config</name>
+        <contents>
+          <attachment>foo: bar</attachment>
+        </contents>
+      </data>
+    </component>
+  </components>
+  <services>
+    <service bom-ref="bom-ref">
+      <provider>
+        <name>name</name>
+        <url>url</url>
+        <contact>
+          <name>name</name>
+          <email>email</email>
+          <phone>phone</phone>
+        </contact>
+      </provider>
+      <group>group</group>
+      <name>name</name>
+      <version>version</version>
+      <description>description</description>
+      <endpoints>
+        <endpoint>endpoint</endpoint>
+      </endpoints>
+      <authenticated>true</authenticated>
+      <x-trust-boundary>true</x-trust-boundary>
+      <data>
+        <dataflow name="Consumer to Stock Service" description="Traffic to/from consumer to service">
+          <classification flow="flow">classification</classification>
+          <governance>
+            <owners>
+              <owner>
+                <organization>
+                  <name>Organization 1</name>
+                </organization>
+              </owner>
+            </owners>
+          </governance>
+          <source>
+            <url>https://0.0.0.0</url>
+          </source>
+          <destination>
+            <url>https://0.0.0.0</url>
+          </destination>
+        </dataflow>
+      </data>
+      <licenses>
+        <expression>expression</expression>
+      </licenses>
+      <externalReferences>
+        <reference type="external reference type">
+          <url>url</url>
+          <comment>comment</comment>
+          <hashes>
+            <hash alg="algorithm">hash value</hash>
+          </hashes>
+        </reference>
+      </externalReferences>
+      <properties>
+        <property name="name">value</property>
+      </properties>
+      <services />
+      <signature>
+        <algorithm>HS512</algorithm>
+        <value>1234567890</value>
+      </signature>
+      <trustZone>trust zone</trustZone>
+    </service>
+  </services>
+  <externalReferences>
+    <reference type="external reference type">
+      <url>url</url>
+      <comment>comment</comment>
+      <hashes>
+        <hash alg="algorithm">hash value</hash>
+      </hashes>
+    </reference>
+  </externalReferences>
+  <dependencies>
+    <dependency ref="ref">
+      <dependency ref="depends on" />
+    </dependency>
+  </dependencies>
+  <compositions>
+    <composition bom-ref="composition-ref">
+      <aggregate>aggregate</aggregate>
+      <assemblies>
+        <assembly ref="assembly-ref" />
+      </assemblies>
+      <dependencies>
+        <dependency ref="dependency-ref" />
+      </dependencies>
+      <vulnerabilities>
+        <vulnerability ref="vulnerability-ref" />
+      </vulnerabilities>
+      <signature>
+        <algorithm>HS512</algorithm>
+        <value>1234567890</value>
+      </signature>
+    </composition>
+  </compositions>
+  <properties>
+    <property name="name">value</property>
+  </properties>
+  <vulnerabilities>
+    <vulnerability bom-ref="bom-ref">
+      <id>id</id>
+      <source>
+        <name>name</name>
+        <url>url</url>
+      </source>
+      <references>
+        <reference>
+          <id>id</id>
+          <source>
+            <name>name</name>
+            <url>url</url>
+          </source>
+        </reference>
+      </references>
+      <ratings>
+        <rating>
+          <source>
+            <name>name</name>
+            <url>url</url>
+          </source>
+          <score>9.8</score>
+          <severity>info</severity>
+          <method>CVSSv3</method>
+          <vector>vector</vector>
+          <justification>justification</justification>
+        </rating>
+      </ratings>
+      <cwes>
+        <cwe>1</cwe>
+        <cwe>2</cwe>
+        <cwe>3</cwe>
+      </cwes>
+      <description>description</description>
+      <detail>detail</detail>
+      <recommendation>recommendation</recommendation>
+      <workaround>workaround</workaround>
+      <proofOfConcept>
+        <reproductionSteps>reproduction steps</reproductionSteps>
+        <environment>production</environment>
+        <supportingMaterial>
+          <attachment content-type="image/jpeg" encoding="base64">abcdefgh</attachment>
+        </supportingMaterial>
+      </proofOfConcept>
+      <advisories>
+        <advisory>
+          <title>title</title>
+          <url>url</url>
+        </advisory>
+      </advisories>
+      <created>created</created>
+      <published>published</published>
+      <updated>updated</updated>
+      <rejected>rejected</rejected>
+      <credits>
+        <organizations>
+          <organization>
+            <name>name</name>
+            <url>url</url>
+            <contact>
+              <name>name</name>
+              <email>email</email>
+              <phone>phone</phone>
+            </contact>
+          </organization>
+        </organizations>
+        <individuals>
+          <individual>
+            <name>name</name>
+            <email>email</email>
+            <phone>phone</phone>
+          </individual>
+        </individuals>
+      </credits>
+      <tools>
+        <tool>
+          <vendor>vendor</vendor>
+          <name>name</name>
+          <version>version</version>
+          <hashes>
+            <hash alg="algorithm">hash value</hash>
+          </hashes>
+          <externalReferences>
+            <reference type="external reference type">
+              <url>url</url>
+              <comment>comment</comment>
+              <hashes>
+                <hash alg="algorithm">hash value</hash>
+              </hashes>
+            </reference>
+          </externalReferences>
+        </tool>
+      </tools>
+      <analysis>
+        <state>not_affected</state>
+        <justification>code_not_reachable</justification>
+        <responses>
+          <response>update</response>
+        </responses>
+        <detail>detail</detail>
+        <firstIssued>2024-01-02</firstIssued>
+        <lastUpdated>2024-01-10</lastUpdated>
+      </analysis>
+      <affects>
+        <target>
+          <ref>ref</ref>
+          <versions>
+            <version>
+              <version>5.0.0</version>
+              <status>unaffected</status>
+            </version>
+            <version>
+              <range>vers:npm/1.2.3|>=2.0.0|&lt;5.0.0</range>
+              <status>affected</status>
+            </version>
+          </versions>
+        </target>
+      </affects>
+      <properties>
+        <property name="name">value</property>
+      </properties>
+    </vulnerability>
+  </vulnerabilities>
+  <signature>
+    <algorithm>HS512</algorithm>
+    <value>1234567890</value>
+  </signature>
+  <annotations>
+    <annotation bom-ref="annotation-1">
+      <subjects>
+        <subject ref="subject1" />
+      </subjects>
+      <annotator>
+        <organization>
+          <name>name</name>
+          <url>url</url>
+          <contact>
+            <name>name</name>
+            <email>email</email>
+            <phone>phone</phone>
+          </contact>
+        </organization>
+      </annotator>
+      <timestamp>timestamp</timestamp>
+      <text>Annotation text</text>
+      <signature>
+        <algorithm>HS512</algorithm>
+        <value>1234567890</value>
+      </signature>
+    </annotation>
+  </annotations>
+  <example:laxValidation>
+    <example:innerElement id="test" />
+  </example:laxValidation>
+  <formulation>
+    <formula bom-ref="formula-1">
+      <components>
+        <component type="platform" bom-ref="component-1">
+          <name>Pipeline controller image</name>
+          <version>v0.47.0</version>
+        </component>
+      </components>
+    </formula>
+  </formulation>
+</bom>
+"#.trim_start();
+            let actual: Bom = read_document_from_string(input);
+            let expected = full_bom_example();
+            assert_eq!(actual, expected);
+        }
     }
 }
